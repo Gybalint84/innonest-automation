@@ -1,0 +1,193 @@
+SQM Hungary – Innonest Automatizáció
+Fájlok leírása
+======================================
+Utolsó frissítés: 2026. június
+
+
+PYTHON FÁJLOK (Railway szerver)
+--------------------------------
+
+server.py
+  A Flask app belépési pontja. Mindössze ~55 sort tartalmaz.
+  Feladata kizárólag az indítás és az összekapcsolás:
+  - Létrehozza a Flask app-ot
+  - Elindítja a megrendelés figyelő háttérszálat
+  - Regisztrálja az árajánlat feltöltő végpontot (/create-arajanlat)
+  - Regisztrálja a Pipedrive webhook végpontokat (/pipedrive-webhook, /visszajelzes/...)
+  - Tartalmazza a /health és /check-now alap végpontokat
+  Üzleti logikát NEM tartalmaz — az mind a többi modulban van.
+
+
+innonest_core.py
+  Az Innonest Playwright alapkönyvtára. Minden más modul ebből importál.
+  Tartalmazza:
+  - Bejelentkezés az Innonestbe (login + session cache kezelés)
+  - React-kompatibilis JS értékbeállítás (js_fill, js_fill_nth)
+  - Ügyfélnév és tételsor kitöltése az árajánlat formban (fill_nev, fill_tetel)
+  - Csatolmány feltöltése (upload_csatolmany)
+  - Árajánlat tételek kinyerése Playwright-tal (get_arajanlat_tetelek):
+      - BID szám alapján megkeresi az árajánlatot a /bids oldalon
+      - Megnyitja a szerkesztőt (/bids/change/ID)
+      - Kinyeri a tételeket, nettó összeget, fizetési feltételt, pénznemet
+  - Szinkron wrapper a pipedrive_addon.py számára (innonest_adatok_leker)
+  - Az aszinkron event loop kezelése (run_in_loop, start_loop)
+
+
+megrendeles_figyelő.py
+  Az Innonest megrendelőlapok automatikus figyelője.
+  5 percenként fut le a háttérben, és elvégzi:
+  - Bejelentkezés az Innonestbe (session cache-sel)
+  - Az összes "Megrendelt" státuszú tétel lekérése a megrendelőlapokról
+  - Duplikáció ellenőrzés (JSON fájl alapján)
+  - Minden új megrendelésnél a Google Apps Script Web App hívása, ami:
+      - Megkeresi a BID számhoz tartozó Google Drive sheetet
+      - Átnevezi: hozzáfűzi a " - MEGRENDELVE" utótagot
+      - Beírja az adatokat a QUiCK API sheetbe (cég, tárgy, nettó stb.)
+  Exportálja a start_figyelő() függvényt, amit a server.py indít el.
+
+
+arajanlat_feltolto.py
+  Az Innonest árajánlat automatikus feltöltője.
+  A /create-arajanlat POST végpontot kezeli.
+  Feladata:
+  - Playwright-tal bejelentkezik az Innonestbe
+  - Kitölti az "Új árajánlat" formot (ügyféladatok, tételek, egységárak)
+  - Elmenti az árajánlatot és visszaadja a BID számot + screenshotokat
+  - Opcionálisan csatolmányt tölt fel az árajánlathoz
+  Exportálja a register_arajanlat_routes(app) függvényt a server.py számára.
+
+
+pipedrive_addon.py
+  A Pipedrive deal megnyerés automatizációja és a visszajelzési rendszer.
+  Három Flask végpontot regisztrál:
+
+  /pipedrive-webhook (POST)
+    - Pipedrive Automation hívja, ha egy deal "nyert" státuszra kerül
+    - Háromrétegű duplikáció védelem (in-memory lock + API check + Sheets check)
+    - Lekéri a deal adatait Pipedrive API-ból (cég, kapcsolattartó, owner)
+    - Innonest Playwright scraping: BID alapján kinyeri az árajánlat tételeit
+    - Generál egy egyedi tokent, elmenti Google Sheets-be
+    - Kiküldi a kivitelezési tájékoztató emailt az ügyfélnek (Gmail via Apps Script)
+
+  /visszajelzes/<token> (GET)
+    - Az ügyfél erre a linkre kattint az emailből
+    - Kiszolgálja a visszajelzes_oldal.html interaktív adatlapot
+    - A token alapján betölti a deal adatait a Google Sheets-ből
+
+  /visszajelzes-submit (POST)
+    - Az ügyfél beküldi a kitöltött adatlapot (időpontok, helyszíni feltételek)
+    - Lekéri az alvállalkozói kalkulációt a Google Sheets-ből
+    - Kiküldi az owner összesítő emailt (összes tétel + kalkuláció)
+    - Ha több kivitelező van: kivitelezőnkénti külön emaileket küld az ownernek
+    - Visszaigazoló emailt küld az ügyfélnek
+    - Feljegyzi a beküldés időbélyegét a Google Sheets-be
+
+
+JAVASCRIPT FÁJL (Google Apps Script)
+--------------------------------------
+
+webapp_script_v6.js
+  Google Apps Script Web App, ami a Railway szerver hívásait kezeli.
+  Telepítési hely: script.google.com → "Innonest megrendelve – excel név módosítás"
+  
+  Két fő funkciócsoportot tartalmaz:
+
+  Eredeti funkciók (megrendelés feldolgozás):
+    - BID szám alapján megkeresi a Google Drive-on a sheetet
+    - Átnevezi a sheetet: hozzáfűzi a " - MEGRENDELVE" utótagot
+    - Kiolvas a G11 cellából (Árajánlat lapfül)
+    - Beírja az adatokat a QUiCK API sheetbe
+    - Duplikáció védelem (Feldolgozott_BID lapfül)
+
+  Új funkciók (Pipedrive automatizáció):
+    - sendEmail: Gmail küldés a céges fiókból
+    - saveToken / getToken / markTokenSent: visszajelzési token kezelés
+    - checkDealSent / markDealSent: duplikáció védelem deal szinten
+    - getKalkulacio: alvállalkozói díjkalkulátor adatok lekérése BID alapján
+
+
+HTML SABLONOK (sablonok/ mappa)
+--------------------------------
+
+sablonok/email_kikuldo.html
+  Az ügyfélnek küldött kivitelezési tájékoztató email.
+  Tulajdonságok:
+  - Email-safe, table-alapú HTML (működik Outlookban, Gmailben, Exchange-ben)
+  - Tartalmazza: fejléc, vállalkozó + ügyfél adatok, intro szöveg
+  - Nagy sárga CTA gomb a visszajelzési linkkel (Outlook VML fallback-kel)
+  - Összefoglaló lista: mit kell kitölteni az adatlapon
+  - Megrendelt munkák táblázata (tételek, mennyiségek, árak)
+  - Munkavégzési feltételek és aljzat műszaki előírások
+  - Garancia, fizetési feltételek, ajánlat érvényessége
+  - Deal owner neve, emailje, telefonszáma a láblécben
+  Minden dinamikus adat {{VÁLTOZÓ}} placeholderrel van jelölve.
+
+sablonok/visszajelzes_oldal.html
+  Az ügyfél böngészőjében megnyíló interaktív visszajelzési adatlap.
+  Tulajdonságok:
+  - Flatpickr range naptár a dátumválasztáshoz (tól-ig, 3 opció)
+  - Pipálós kártyák részletező szövegmezőkkel:
+      - Belépési adatok (névsor, rendszámok)
+      - Speciális felszerelés
+      - Kötelező biztonsági oktatás
+      - Szállítólevél szükséges
+  - Egyéb megjegyzés szövegmező
+  - Sikeres beküldés után köszönőképernyő (oldal újratöltés nélkül)
+  - Hibaüzenet ha a szerver nem elérhető
+  A sötét (SQM brandelt) design csak a fejlécen és az időpontválasztón,
+  a pipálós kártyák fehér alapon jelennek meg az olvashatóság érdekében.
+
+
+EGYÉB FÁJLOK
+-------------
+
+Dockerfile
+  A Railway deployment konténer leírása.
+  Playwright + Chromium + Python alapú image-t használ.
+  Másolja be az összes szükséges fájlt a konténerbe:
+  server.py, innonest_core.py, megrendeles_figyelő.py,
+  arajanlat_feltolto.py, pipedrive_addon.py, sablonok/ mappa.
+
+requirements.txt
+  Python függőségek listája.
+  Fontosabb csomagok: flask, flask-cors, playwright, requests.
+
+docs/sqm_automatizacio.pdf
+  Az automatizáció folyamatábrája PDF formátumban.
+  7 fázisra bontva mutatja a teljes munkafolyamatot
+  a Pipedrive deal megnyerésétől az alvállalkozói emailekig.
+
+README.md
+  Részletes technikai dokumentáció (magyarul).
+  Tartalmazza: architektúra, telepítési útmutató, API végpontok,
+  környezeti változók, Google Sheets struktúra, hibaelhárítás.
+
+
+FÜGGŐSÉGI TÉRKÉP
+-----------------
+
+  server.py
+    ├── innonest_core.py          (run_in_loop, login, session)
+    ├── megrendeles_figyelő.py    (start_figyelő)
+    │     └── innonest_core.py   (run_in_loop, login, load_session)
+    ├── arajanlat_feltolto.py     (register_arajanlat_routes)
+    │     └── innonest_core.py   (run_in_loop, login, fill_tetel stb.)
+    └── pipedrive_addon.py        (register_pipedrive_routes)
+          └── innonest_core.py   (innonest_adatok_leker)
+
+  webapp_script_v6.js  ←  Railway hívja (HTTP POST, WEBAPP_URL)
+  sablonok/*.html      ←  pipedrive_addon.py tölti be és tölti ki
+
+
+RAILWAY ENVIRONMENT VARIABLES
+-------------------------------
+
+  INNONEST_EMAIL          Innonest bejelentkezési email
+  INNONEST_PASSWORD       Innonest jelszó
+  API_KEY                 Titkos kulcs a /create-arajanlat és /check-now végpontokhoz
+  WEBAPP_SECRET           Titkos kulcs az Apps Script Web App-hoz
+  WEBAPP_URL              Apps Script Web App URL-je (...googleusercontent.com/exec)
+  PIPEDRIVE_API_TOKEN     Pipedrive személyes API token (Settings → API)
+  PIPEDRIVE_BID_FIELD_KEY BID szám custom mező API kulcsa (Settings → Data fields)
+  GOOGLE_SHEET_ID         Fő Google Sheet ID-ja (az URL /d/ és /edit/ között)
+  RAILWAY_PUBLIC_DOMAIN   Railway automatikusan tölti ki (nem kell kézzel megadni)
