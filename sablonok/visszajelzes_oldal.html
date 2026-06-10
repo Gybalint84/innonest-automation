@@ -1,0 +1,1128 @@
+<!DOCTYPE html>
+<html lang="hu">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SQM Hungary – Előkészítési Adatlap | {{BID_SZAM}}</title>
+  <link href="https://fonts.googleapis.com/css2?family=Barlow:ital,wght@0,300;0,400;0,500;0,600;0,700;1,400&family=Barlow+Condensed:wght@500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css">
+  <script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
+  <script src="https://cdn.jsdelivr.net/npm/flatpickr/dist/l10n/hu.js"></script>
+  <style>
+    /* ═══════════════════════════════════════════
+       RESET & BASE
+    ═══════════════════════════════════════════ */
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      background: #dcdcdc;
+      font-family: 'Barlow', sans-serif;
+      font-size: 14px;
+      color: #333;
+      padding: 40px 16px;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .email-wrapper {
+      max-width: 680px;
+      margin: 0 auto;
+      background: #ffffff;
+      box-shadow: 0 8px 48px rgba(0,0,0,0.18);
+    }
+
+    /* ═══════════════════════════════════════════
+       FEJLÉC
+    ═══════════════════════════════════════════ */
+    .header {
+      background: #1a1a1a;
+      padding: 26px 36px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 3px solid #f0a500;
+    }
+
+    .logo-area { display: flex; flex-direction: column; }
+
+    .logo-name {
+      font-family: 'Barlow Condensed', sans-serif;
+      font-weight: 700;
+      font-size: 24px;
+      color: #ffffff;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      line-height: 1;
+    }
+
+    .logo-sub {
+      font-size: 9px;
+      color: #888;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+      margin-top: 4px;
+    }
+
+    .logo-badge {
+      width: 56px;
+      height: 56px;
+      background: #f0a500;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-family: 'Barlow Condensed', sans-serif;
+      font-weight: 700;
+      font-size: 13px;
+      color: #1a1a1a;
+      letter-spacing: 0.04em;
+      text-align: center;
+      text-transform: uppercase;
+      line-height: 1.2;
+      flex-shrink: 0;
+    }
+
+    /* ═══════════════════════════════════════════
+       DOC FEJLÉC SÁV
+    ═══════════════════════════════════════════ */
+    .doc-bar {
+      background: #f4f4f4;
+      border-bottom: 1px solid #e0e0e0;
+      padding: 12px 36px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+    }
+
+    .doc-bar-item {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+
+    .doc-bar-label {
+      font-size: 9px;
+      font-weight: 600;
+      color: #999;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+
+    .doc-bar-value {
+      font-size: 13px;
+      font-weight: 600;
+      color: #1a1a1a;
+    }
+
+    .doc-bar-divider {
+      width: 1px;
+      height: 32px;
+      background: #d8d8d8;
+    }
+
+    .doc-type-badge {
+      background: #f0a500;
+      color: #1a1a1a;
+      font-family: 'Barlow Condensed', sans-serif;
+      font-weight: 700;
+      font-size: 11px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      padding: 4px 12px;
+      white-space: nowrap;
+    }
+
+    /* ═══════════════════════════════════════════
+       FELADÓ / ÜGYFÉL BLOKK
+    ═══════════════════════════════════════════ */
+    .parties-row {
+      display: flex;
+      border-bottom: 1px solid #ebebeb;
+    }
+
+    .party-block {
+      flex: 1;
+      padding: 22px 36px;
+    }
+
+    .party-block:first-child {
+      border-right: 1px solid #ebebeb;
+    }
+
+    .party-label {
+      font-size: 9px;
+      font-weight: 700;
+      color: #f0a500;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      margin-bottom: 8px;
+    }
+
+    .party-name {
+      font-family: 'Barlow Condensed', sans-serif;
+      font-weight: 600;
+      font-size: 16px;
+      color: #1a1a1a;
+      margin-bottom: 6px;
+      line-height: 1.2;
+    }
+
+    .party-detail {
+      font-size: 12px;
+      color: #666;
+      line-height: 1.7;
+    }
+
+    .party-detail strong {
+      color: #444;
+      font-weight: 600;
+    }
+
+    /* ═══════════════════════════════════════════
+       SZEKCIÓK
+    ═══════════════════════════════════════════ */
+    .section {
+      padding: 24px 36px;
+      border-bottom: 1px solid #ebebeb;
+    }
+
+    .section:last-child {
+      border-bottom: none;
+    }
+
+    .section-header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 16px;
+    }
+
+    .section-accent {
+      width: 3px;
+      height: 20px;
+      background: #f0a500;
+      flex-shrink: 0;
+    }
+
+    .section-title {
+      font-family: 'Barlow Condensed', sans-serif;
+      font-weight: 700;
+      font-size: 13px;
+      color: #1a1a1a;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+    }
+
+    /* ═══════════════════════════════════════════
+       INTRO SZÖVEG
+    ═══════════════════════════════════════════ */
+    .intro-text {
+      font-size: 14px;
+      color: #444;
+      line-height: 1.75;
+    }
+
+    .intro-text strong {
+      color: #1a1a1a;
+      font-weight: 600;
+    }
+
+    /* ═══════════════════════════════════════════
+       MEGRENDELÉS TÁBLÁZAT
+    ═══════════════════════════════════════════ */
+    .order-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+
+    .order-table thead tr {
+      background: #1a1a1a;
+    }
+
+    .order-table thead th {
+      padding: 10px 12px;
+      text-align: left;
+      font-size: 9px;
+      font-weight: 700;
+      color: #aaa;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+
+    .order-table thead th:last-child,
+    .order-table thead th:nth-child(3),
+    .order-table thead th:nth-child(4) {
+      text-align: right;
+    }
+
+    .order-table tbody tr {
+      border-bottom: 1px solid #f0f0f0;
+    }
+
+    .order-table tbody tr:nth-child(even) {
+      background: #fafafa;
+    }
+
+    .order-table tbody td {
+      padding: 10px 12px;
+      color: #444;
+      vertical-align: top;
+    }
+
+    .order-table tbody td:nth-child(1) {
+      color: #999;
+      font-size: 11px;
+      width: 30px;
+    }
+
+    .order-table tbody td:nth-child(3),
+    .order-table tbody td:nth-child(4),
+    .order-table tbody td:last-child {
+      text-align: right;
+      white-space: nowrap;
+    }
+
+    .order-table tbody td:last-child {
+      font-weight: 600;
+      color: #1a1a1a;
+    }
+
+    .total-row {
+      background: #f7f7f7 !important;
+      border-top: 2px solid #1a1a1a !important;
+      border-bottom: none !important;
+    }
+
+    .total-row td {
+      padding: 13px 12px !important;
+      font-weight: 700 !important;
+      color: #1a1a1a !important;
+      font-size: 13px !important;
+    }
+
+    .total-row td:last-child {
+      color: #f0a500 !important;
+      font-size: 16px !important;
+      font-family: 'Barlow Condensed', sans-serif;
+    }
+
+    .unit-label {
+      font-size: 11px;
+      color: #999;
+    }
+
+    /* ═══════════════════════════════════════════
+       FELTÉTELEK LISTA
+    ═══════════════════════════════════════════ */
+    .conditions-list {
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    .conditions-list li {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      padding: 7px 0;
+      font-size: 13px;
+      color: #555;
+      line-height: 1.55;
+      border-bottom: 1px solid #f5f5f5;
+    }
+
+    .conditions-list li:last-child {
+      border-bottom: none;
+    }
+
+    .cond-dot {
+      width: 6px;
+      height: 6px;
+      background: #f0a500;
+      border-radius: 50%;
+      flex-shrink: 0;
+      margin-top: 6px;
+    }
+
+    .aljzat-box {
+      background: #f7f7f7;
+      border-left: 3px solid #f0a500;
+      padding: 14px 18px;
+      margin-top: 14px;
+      font-size: 13px;
+      color: #555;
+      line-height: 1.75;
+    }
+
+    .aljzat-box-title {
+      display: block;
+      margin-bottom: 8px;
+      color: #1a1a1a;
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+    }
+
+    .aljzat-box p { margin-bottom: 4px; }
+    .aljzat-box p:last-child { margin-bottom: 0; }
+
+    /* ═══════════════════════════════════════════
+       IDŐPONTVÁLASZTÓ
+    ═══════════════════════════════════════════ */
+    .scheduler-box {
+      background: #1a1a1a;
+      padding: 28px 36px;
+      margin: 0;
+    }
+
+    .scheduler-box .section-header { margin-bottom: 8px; }
+    .scheduler-box .section-accent { background: #f0a500; }
+    .scheduler-box .section-title { color: #f0a500; }
+
+    .scheduler-subtitle {
+      font-size: 13px;
+      color: #888;
+      margin-bottom: 22px;
+      margin-left: 13px;
+      line-height: 1.6;
+    }
+
+    .date-options {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      margin-bottom: 16px;
+    }
+
+    .date-option {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .date-option-label {
+      font-size: 11px;
+      font-weight: 600;
+      color: #aaa;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      width: 80px;
+      flex-shrink: 0;
+    }
+
+    .date-input {
+      flex: 1;
+      background: #2a2a2a;
+      border: 1px solid #3a3a3a;
+      border-radius: 0;
+      padding: 8px 12px;
+      color: #eee;
+      font-family: 'Barlow', sans-serif;
+      font-size: 13px;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+
+    .date-input:focus {
+      border-color: #f0a500;
+    }
+
+    .date-input::-webkit-calendar-picker-indicator {
+      display: none;
+    }
+
+    /* ── Flatpickr egyedi stílus ── */
+    .flatpickr-calendar {
+      background: #2a2a2a !important;
+      border: 1px solid #444 !important;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.5) !important;
+      font-family: 'Barlow', sans-serif !important;
+    }
+    .flatpickr-months { background: #1a1a1a !important; }
+    .flatpickr-month, .flatpickr-current-month { color: #fff !important; fill: #fff !important; }
+    .flatpickr-current-month .flatpickr-monthDropdown-months { background: #1a1a1a !important; color: #fff !important; }
+    .flatpickr-weekday { color: #888 !important; background: #222 !important; }
+    span.flatpickr-weekday { color: #888 !important; background: #222 !important; }
+    .flatpickr-day { color: #ccc !important; border-radius: 0 !important; }
+    .flatpickr-day:hover { background: #333 !important; border-color: #f0a500 !important; color: #fff !important; }
+    .flatpickr-day.selected, .flatpickr-day.startRange, .flatpickr-day.endRange {
+      background: #f0a500 !important; border-color: #f0a500 !important;
+      color: #1a1a1a !important; font-weight: 700 !important;
+    }
+    .flatpickr-day.inRange {
+      background: rgba(240,165,0,0.25) !important;
+      border-color: transparent !important; color: #fff !important;
+      box-shadow: -5px 0 0 rgba(240,165,0,0.25), 5px 0 0 rgba(240,165,0,0.25) !important;
+    }
+    .flatpickr-day.flatpickr-disabled { color: #555 !important; }
+    .flatpickr-day.today { border-color: #f0a500 !important; color: #f0a500 !important; }
+    .flatpickr-prev-month svg, .flatpickr-next-month svg { fill: #aaa !important; }
+    .flatpickr-prev-month:hover svg, .flatpickr-next-month:hover svg { fill: #f0a500 !important; }
+    .numInputWrapper input { color: #fff !important; background: transparent !important; }
+    .flatpickr-time { background: #222 !important; border-top: 1px solid #444 !important; }
+
+    .note-input {
+      width: 100%;
+      background: #2a2a2a;
+      border: 1px solid #3a3a3a;
+      border-radius: 0;
+      padding: 10px 12px;
+      color: #eee;
+      font-family: 'Barlow', sans-serif;
+      font-size: 13px;
+      outline: none;
+      resize: vertical;
+      min-height: 70px;
+      margin-top: 12px;
+      transition: border-color 0.2s;
+    }
+
+    .note-input:focus {
+      border-color: #f0a500;
+    }
+
+    .note-input::placeholder,
+    .date-input::placeholder {
+      color: #555;
+    }
+
+    .scheduler-actions {
+      display: flex;
+      gap: 12px;
+      margin-top: 18px;
+    }
+
+    .btn-primary {
+      flex: 1;
+      background: #f0a500;
+      color: #1a1a1a;
+      border: none;
+      padding: 12px 20px;
+      font-family: 'Barlow Condensed', sans-serif;
+      font-weight: 700;
+      font-size: 13px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      cursor: pointer;
+      transition: background 0.15s, transform 0.1s;
+    }
+
+    .btn-primary:hover {
+      background: #ffb820;
+      transform: translateY(-1px);
+    }
+
+    .btn-secondary {
+      background: transparent;
+      color: #888;
+      border: 1px solid #3a3a3a;
+      padding: 12px 20px;
+      font-family: 'Barlow Condensed', sans-serif;
+      font-weight: 600;
+      font-size: 13px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      cursor: pointer;
+      transition: border-color 0.15s, color 0.15s;
+      white-space: nowrap;
+    }
+
+    .btn-secondary:hover {
+      border-color: #f0a500;
+      color: #f0a500;
+    }
+
+    /* ═══════════════════════════════════════════
+       INFÓ BLOKK (garancia, fizetés)
+    ═══════════════════════════════════════════ */
+    .info-grid {
+      display: flex;
+      gap: 0;
+    }
+
+    .info-card {
+      flex: 1;
+      padding: 18px 20px;
+      background: #f9f9f9;
+      border: 1px solid #eeeeee;
+    }
+
+    .info-card:not(:last-child) {
+      border-right: none;
+    }
+
+    .info-card-icon {
+      font-size: 18px;
+      margin-bottom: 6px;
+    }
+
+    .info-card-title {
+      font-size: 10px;
+      font-weight: 700;
+      color: #f0a500;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      margin-bottom: 5px;
+    }
+
+    .info-card-text {
+      font-size: 12px;
+      color: #666;
+      line-height: 1.6;
+    }
+
+    /* ═══════════════════════════════════════════
+       LÁBLÉC
+    ═══════════════════════════════════════════ */
+    .footer {
+      background: #111;
+      padding: 24px 36px;
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 24px;
+      flex-wrap: wrap;
+    }
+
+    .footer-brand {
+      font-family: 'Barlow Condensed', sans-serif;
+      font-weight: 700;
+      font-size: 15px;
+      color: #fff;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      margin-bottom: 4px;
+    }
+
+    .footer-tagline {
+      font-size: 10px;
+      color: #555;
+      letter-spacing: 0.08em;
+    }
+
+    .footer-contacts {
+      text-align: right;
+    }
+
+    .footer-contact-line {
+      font-size: 11px;
+      color: #777;
+      line-height: 1.9;
+    }
+
+    .footer-contact-line a {
+      color: #f0a500;
+      text-decoration: none;
+    }
+
+    .footer-bottom {
+      background: #0d0d0d;
+      padding: 10px 36px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-top: 1px solid #222;
+    }
+
+    .footer-bottom-text {
+      font-size: 10px;
+      color: #444;
+    }
+
+    .footer-bid {
+      font-size: 10px;
+      color: #555;
+      font-family: 'Barlow Condensed', sans-serif;
+      letter-spacing: 0.08em;
+    }
+
+    /* ═══════════════════════════════════════════
+       BELÉPÉSI KÖVETELMÉNYEK SZEKCIÓ
+    ═══════════════════════════════════════════ */
+    .req-item {
+      border: 1px solid #e0e0e0;
+      margin-bottom: 8px;
+      transition: border-color 0.2s, box-shadow 0.2s;
+      background: #fff;
+    }
+
+    .req-item:last-child { margin-bottom: 0; }
+
+    .req-item:hover {
+      border-color: #ccc;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+    }
+
+    .req-item.is-checked {
+      border-color: #f0a500;
+      background: #fffdf5;
+      box-shadow: 0 2px 10px rgba(240,165,0,0.12);
+    }
+
+    .req-header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 13px 16px;
+      cursor: pointer;
+      user-select: none;
+    }
+
+    .req-checkbox {
+      width: 18px;
+      height: 18px;
+      border: 2px solid #ccc;
+      border-radius: 3px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+      transition: border-color 0.2s, background 0.2s;
+      background: #fff;
+    }
+
+    .req-item.is-checked .req-checkbox {
+      border-color: #f0a500;
+      background: #f0a500;
+    }
+
+    .req-checkmark {
+      display: none;
+      color: #1a1a1a;
+      font-size: 12px;
+      font-weight: 700;
+      line-height: 1;
+    }
+
+    .req-item.is-checked .req-checkmark { display: block; }
+
+    .req-label {
+      font-size: 13px;
+      font-weight: 500;
+      color: #333;
+      line-height: 1.4;
+      flex: 1;
+    }
+
+    .req-item.is-checked .req-label { color: #1a1a1a; font-weight: 600; }
+
+    .req-expand-icon {
+      font-size: 10px;
+      color: #bbb;
+      transition: transform 0.2s, color 0.2s;
+      flex-shrink: 0;
+    }
+
+    .req-item.is-checked .req-expand-icon { color: #f0a500; }
+    .req-item.is-open   .req-expand-icon { transform: rotate(90deg); }
+
+    .req-body {
+      display: none;
+      padding: 0 16px 14px 46px;
+    }
+
+    .req-item.is-open .req-body { display: block; }
+
+    .req-textarea {
+      width: 100%;
+      background: #f9f9f9;
+      border: 1px solid #e0e0e0;
+      border-radius: 0;
+      padding: 9px 12px;
+      font-family: 'Barlow', sans-serif;
+      font-size: 13px;
+      color: #333;
+      resize: vertical;
+      min-height: 64px;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+
+    .req-textarea:focus { border-color: #f0a500; }
+    .req-textarea::placeholder { color: #bbb; }
+
+    .req-hint {
+      font-size: 11px;
+      color: #aaa;
+      margin-bottom: 6px;
+      line-height: 1.5;
+    }
+
+    .req-intro {
+      font-size: 13px;
+      color: #666;
+      line-height: 1.65;
+      margin-bottom: 16px;
+      padding: 12px 14px;
+      background: #f9f9f9;
+      border-left: 3px solid #f0a500;
+    }
+
+    /* ═══════════════════════════════════════════
+       SUCCESS OVERLAY
+    ═══════════════════════════════════════════ */
+    .success-overlay {
+      display: none;
+      background: #1a1a1a;
+      border: 1px solid #f0a500;
+      padding: 16px 20px;
+      margin-top: 14px;
+      font-size: 13px;
+      color: #f0a500;
+      text-align: center;
+      font-family: 'Barlow Condensed', sans-serif;
+      font-weight: 600;
+      letter-spacing: 0.06em;
+    }
+  </style>
+</head>
+<body>
+
+<div class="email-wrapper">
+
+  <!-- ── FEJLÉC ── -->
+  <div class="header">
+    <div class="logo-area">
+      <div class="logo-name">SQM Hungary</div>
+      <div class="logo-sub">Ipari padlóburkolás &amp; bevonatok</div>
+    </div>
+    <div class="logo-badge">SQM<br>HU</div>
+  </div>
+
+  <!-- ── DOC FEJLÉC SÁV ── -->
+  <div class="doc-bar">
+    <div class="doc-bar-item">
+      <span class="doc-bar-label">Referencia</span>
+      <span class="doc-bar-value">{{BID_SZAM}}</span>
+    </div>
+    <div class="doc-bar-divider"></div>
+    <div class="doc-bar-item">
+      <span class="doc-bar-label">Dátum</span>
+      <span class="doc-bar-value">{{DATUM}}</span>
+    </div>
+    <div class="doc-bar-divider"></div>
+    <div class="doc-bar-item">
+      <span class="doc-bar-label">Deal értéke</span>
+      <span class="doc-bar-value">{{NETTO_OSSZEG}} {{PENZNEM}}</span>
+    </div>
+    <div class="doc-bar-divider"></div>
+    <div class="doc-type-badge">Kivitelezési tájékoztató</div>
+  </div>
+
+  <!-- ── FELADÓ / ÜGYFÉL ── -->
+  <div class="parties-row">
+    <div class="party-block">
+      <div class="party-label">Vállalkozó</div>
+      <div class="party-name">SQM Hungary Kft.</div>
+      <div class="party-detail">
+        Ipari padlóburkolás &amp; bevonatok<br>
+        <strong>Kapcsolattartó:</strong> {{OWNER_NEV}}<br>
+        {{OWNER_TELEFON_SOR_HTML}}<strong>Email:</strong> {{OWNER_EMAIL}}<br>
+        <strong>Web:</strong> sqm-hungary.hu
+      </div>
+    </div>
+    <div class="party-block">
+      <div class="party-label">Megrendelő</div>
+      <div class="party-name">{{CEGNEV}}</div>
+      <div class="party-detail">
+        <strong>Kapcsolattartó:</strong> {{KAPCSOLATTARTO_NEV}}<br>
+        <strong>Email:</strong> {{KAPCSOLATTARTO_EMAIL}}<br>
+        <strong>Telefon:</strong> {{KAPCSOLATTARTO_TELEFON}}<br>
+        <strong>Cím:</strong> {{CIM}}
+      </div>
+    </div>
+  </div>
+
+  <!-- ── INTRO SZÖVEG ── -->
+  <div class="section">
+    <div class="intro-text">
+      Tisztelt <strong>{{KAPCSOLATTARTO_NEV}}</strong>!<br><br>
+      Az alábbiakban összefoglaltuk a <strong>{{BID_SZAM}}</strong> számú árajánlatunkra vonatkozó megrendelés kivitelezési részleteit és a helyszíni előírásokat.
+      Kérjük, töltse ki az alábbi adatlapot, jelezze vissza az Önre vonatkozó belépési feltételeket, és jelölje meg a megfelelő kivitelezési időpontokat.
+      Az adatok beküldése után kollégánk felveszi Önnel a kapcsolatot a végleges egyeztetés érdekében.
+    </div>
+  </div>
+
+  <!-- ── BELÉPÉSI & HELYSZÍNI KÖVETELMÉNYEK (fehér szekció) ── -->
+  <div class="section">
+    <div class="section-header">
+      <div class="section-accent"></div>
+      <div class="section-title">Belépési &amp; helyszíni követelmények</div>
+    </div>
+    <p style="font-size:13px;color:#666;line-height:1.65;margin:0 0 18px 0;">
+      Kérjük, jelölje be az Önre vonatkozó előírásokat, és adja meg a szükséges részleteket.
+      Ezeket az információkat a kivitelezés megkezdése előtt kell egyeztetnünk.
+    </p>
+
+    <!-- 1. Belépési adatok -->
+    <div class="req-item" id="req1">
+      <div class="req-header" onclick="toggleReq('req1')">
+        <div class="req-checkbox"><span class="req-checkmark">&#10003;</span></div>
+        <span class="req-label">A kivitelezés helyszínére való belépéshez előzetes névsor és/vagy rendszám megadása szükséges</span>
+        <span class="req-expand-icon">&#9654;</span>
+      </div>
+      <div class="req-body">
+        <div class="req-hint">Kérjük, adja meg hogy pontosan milyen adatokat, és kinek kell eljuttatni (pl. biztonsági szolgálat, portaszolgálat).</div>
+        <textarea class="req-textarea" id="req1_text" placeholder="Pl. biztonsági szolgálatnak kell megadni a neveket és rendszámokat legalább 48 órával előre…"></textarea>
+      </div>
+    </div>
+
+    <!-- 2. Speciális felszerelés -->
+    <div class="req-item" id="req2">
+      <div class="req-header" onclick="toggleReq('req2')">
+        <div class="req-checkbox"><span class="req-checkmark">&#10003;</span></div>
+        <span class="req-label">A munkavégzéshez szükséges speciális felszerelést az Ügyfél biztosítja</span>
+        <span class="req-expand-icon">&#9654;</span>
+      </div>
+      <div class="req-body">
+        <div class="req-hint">Kérjük, pontosítsa, milyen felszerelésről van szó és hogyan lesz elérhető a kivitelezők számára.</div>
+        <textarea class="req-textarea" id="req2_text" placeholder="Pl. állvány, emelő berendezés, védőfelszerelés típusa…"></textarea>
+      </div>
+    </div>
+
+    <!-- 3. Kötelező oktatás -->
+    <div class="req-item" id="req3">
+      <div class="req-header" onclick="toggleReq('req3')">
+        <div class="req-checkbox"><span class="req-checkmark">&#10003;</span></div>
+        <span class="req-label">A munkavégzés előtt kötelező biztonsági / tűzvédelmi oktatáson kell részt venni</span>
+        <span class="req-expand-icon">&#9654;</span>
+      </div>
+      <div class="req-body">
+        <div class="req-hint">Mikor végezhető el az oktatás, és mennyi időt vesz igénybe?</div>
+        <textarea class="req-textarea" id="req3_text" placeholder="Pl. munkakezdés előtt 1 nappal, kb. 2 óra, helyszínen…"></textarea>
+      </div>
+    </div>
+
+    <!-- 4. Szállítólevél -->
+    <div class="req-item" id="req4">
+      <div class="req-header" onclick="toggleReq('req4')">
+        <div class="req-checkbox"><span class="req-checkmark">&#10003;</span></div>
+        <span class="req-label">A kivitelezéshez használt anyagokról / eszközökről szállítólevél szükséges</span>
+        <span class="req-expand-icon">&#9654;</span>
+      </div>
+      <div class="req-body">
+        <div class="req-hint">Egyéb tudnivalók a szállítólevelekkel kapcsolatban (pl. kinek kell átadni, milyen formában).</div>
+        <textarea class="req-textarea" id="req4_text" placeholder="Pl. biztonsági portán be kell mutatni, elektronikus formátum is elfogadott…"></textarea>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── IDŐPONTVÁLASZTÓ (sötét szekció) ── -->
+  <div class="scheduler-box">
+    <div class="section-header">
+      <div class="section-accent"></div>
+      <div class="section-title">Kivitelezési időpont megjelölése</div>
+    </div>
+    <div class="scheduler-subtitle">
+      Kérjük, jelöljön meg legfeljebb 3 preferált időpontot.<br>
+      A végleges időpontot közösen egyeztetjük Önnel.
+    </div>
+
+    <!-- Időpontok -->
+    <p style="margin:0 0 6px 0;font-family:'Barlow Condensed',sans-serif;font-size:11px;font-weight:700;color:#f0a500;letter-spacing:0.12em;text-transform:uppercase;">Preferált kivitelezési időpontok</p>
+    <p style="margin:0 0 16px 0;font-family:'Barlow',sans-serif;font-size:12px;color:#888;line-height:1.5;">Kattintson a mezőre és válassza ki a kezdő, majd a befejező dátumot.</p>
+    <div class="date-options">
+      <div class="date-option">
+        <span class="date-option-label">1. opció</span>
+        <input type="text" class="date-input range-picker" id="range1" placeholder="Kattintson a dátum kiválasztásához…" readonly>
+      </div>
+      <div class="date-option">
+        <span class="date-option-label">2. opció</span>
+        <input type="text" class="date-input range-picker" id="range2" placeholder="Kattintson a dátum kiválasztásához…" readonly>
+      </div>
+      <div class="date-option">
+        <span class="date-option-label">3. opció</span>
+        <input type="text" class="date-input range-picker" id="range3" placeholder="Kattintson a dátum kiválasztásához…" readonly>
+      </div>
+    </div>
+
+    <!-- Egyéb megjegyzés -->
+    <p style="margin:24px 0 10px 0;font-family:'Barlow Condensed',sans-serif;font-size:11px;font-weight:700;color:#f0a500;letter-spacing:0.12em;text-transform:uppercase;">Egyéb megjegyzés</p>
+    <textarea class="note-input" id="noteText" placeholder="Egyéb megjegyzés, kérés (pl. munkaidő-korlátok, speciális belépési feltételek)…"></textarea>
+
+    <div class="scheduler-actions">
+      <button class="btn-primary" onclick="sendDates()">Visszajelzés küldése</button>
+      <button class="btn-secondary" onclick="window.open('{{CALENDLY_LINK}}','_blank')">&#128197; Naptárban foglal</button>
+    </div>
+
+    <div id="errorMsg" style="display:none;background:#2a1a1a;border:1px solid #c0392b;padding:14px 18px;margin-top:14px;font-size:13px;color:#e74c3c;text-align:center;font-family:'Barlow',sans-serif;">
+      &#10007; Hiba történt a küldés során. Kérjük, próbálja újra, vagy vegye fel a kapcsolatot kollégánkkal közvetlenül.
+    </div>
+  </div>
+
+  <!-- ── LÁBLÉC ── -->
+  <div class="footer">
+    <div>
+      <div class="footer-brand">SQM Hungary Kft.</div>
+      <div class="footer-tagline">Ipari padlóburkolás &amp; bevonatok</div>
+    </div>
+    <div class="footer-contacts">
+      <div class="footer-contact-line" style="color:#aaa;font-size:10px;margin-bottom:4px;letter-spacing:0.08em;text-transform:uppercase;">Kapcsolattartó kolléga</div>
+      <div class="footer-contact-line" style="color:#ddd;font-weight:600;">{{OWNER_NEV}}</div>
+      {{OWNER_TELEFON_SOR}}
+      <div class="footer-contact-line">✉ <a href="mailto:{{OWNER_EMAIL}}">{{OWNER_EMAIL}}</a></div>
+      <div class="footer-contact-line">🌐 <a href="https://sqm-hungary.hu" style="color:#f0a500;text-decoration:none;">sqm-hungary.hu</a></div>
+    </div>
+  </div>
+
+  <div class="footer-bottom">
+    <span class="footer-bottom-text">© 2026 SQM Hungary Kft. — Bizalmasan kezelendő</span>
+    <span class="footer-bid">{{BID_SZAM}} · {{DATUM}}</span>
+  </div>
+
+</div><!-- /email-wrapper -->
+
+<script>
+  // ── Dátum minimum: ma ──
+  const today = new Date().toISOString().split('T')[0];
+
+  // ── Flatpickr range naptár inicializálás ──
+  const fpConfig = {
+    mode: "range",
+    minDate: "today",
+    locale: "hu",
+    dateFormat: "Y-m-d",
+    showMonths: 1,
+    disableMobile: false,
+    onClose: function(selectedDates, dateStr, instance) {
+      if (selectedDates.length === 2) {
+        instance.element.style.borderColor = '#f0a500';
+      }
+    }
+  };
+
+  flatpickr("#range1", fpConfig);
+  flatpickr("#range2", fpConfig);
+  flatpickr("#range3", fpConfig);
+
+  // ── Belépési követelmény toggle – pipa be/ki ──
+  function toggleReq(id) {
+    const item = document.getElementById(id);
+    const isChecked = item.classList.contains('is-checked');
+    const isOpen    = item.classList.contains('is-open');
+
+    if (!isChecked) {
+      // Nincs pipálva → bepipál és kinyit
+      item.classList.add('is-checked', 'is-open');
+    } else if (isOpen) {
+      // Pipálva és nyitva → kattintás a fejlécre: kiveszi a pipát és becsukja
+      item.classList.remove('is-checked', 'is-open');
+      // Textarea törlése
+      const ta = item.querySelector('textarea');
+      if (ta) ta.value = '';
+    } else {
+      // Pipálva de csukva → kinyit
+      item.classList.add('is-open');
+    }
+  }
+
+  // ── Visszajelzés küldése a Railway szervernek ──
+  async function sendDates() {
+    const r1 = document.getElementById('range1').value;
+    const r2 = document.getElementById('range2').value;
+    const r3 = document.getElementById('range3').value;
+    const note = document.getElementById('noteText').value.trim();
+
+    // Validáció: legalább egy teljes intervallum kell
+    function parseRange(val) {
+      if (!val) return null;
+      // Flatpickr különböző locale-oknál más elválasztót használhat:
+      // " to ", " — ", " – ", " до "
+      const separators = [' to ', ' — ', ' – ', ' до ', ' - '];
+      for (const sep of separators) {
+        const parts = val.split(sep);
+        if (parts.length === 2 && parts[0].trim() && parts[1].trim()) {
+          return parts[0].trim() + ' – ' + parts[1].trim();
+        }
+      }
+      // Ha már tartalmaz dátum-dátum mintát elválasztó nélkül
+      const m = val.match(/(\d{4}-\d{2}-\d{2})\s*[\u2013\u2014\-–—to]+\s*(\d{4}-\d{2}-\d{2})/);
+      if (m) return m[1] + ' – ' + m[2];
+      return null;
+    }
+
+    const ido1 = parseRange(r1);
+    const ido2 = parseRange(r2);
+    const ido3 = parseRange(r3);
+
+    if (!ido1 && !ido2 && !ido3) {
+      alert('Kérjük, adjon meg legalább egy preferált időintervallumot! Kattintson a mezőre és válassza ki a kezdő és befejező dátumot.');
+      return;
+    }
+
+    const idopontok = [ido1, ido2, ido3].filter(Boolean);
+
+    // Belépési követelmények összegyűjtése
+    const reqLabels = {
+      req1: 'Nevek és rendszámok leadása szükséges',
+      req2: 'Speciális felszerelést az Ügyfél biztosít',
+      req3: 'Kötelező biztonsági oktatás szükséges',
+      req4: 'Szállítólevél szükséges az anyagokhoz/eszközökhöz'
+    };
+
+    const kovetelmenyek = [];
+    Object.keys(reqLabels).forEach(key => {
+      const item = document.getElementById(key);
+      if (item && item.classList.contains('is-checked')) {
+        const detail = document.getElementById(key + '_text').value.trim();
+        kovetelmenyek.push({ label: reqLabels[key], reszlet: detail || '' });
+      }
+    });
+
+    // Gomb letiltása + loading állapot
+    const btn = document.querySelector('.btn-primary');
+    btn.disabled = true;
+    btn.textContent = 'Küldés folyamatban…';
+    btn.style.opacity = '0.7';
+
+    const payload = {
+      token:          '{{TOKEN}}',
+      idopontok:      idopontok,
+      kovetelmenyek:  kovetelmenyek,
+      megjegyzes:     note
+    };
+
+    try {
+      const resp = await fetch('/visszajelzes-submit', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify(payload)
+      });
+
+      if (resp.ok) {
+        // Sikeres küldés → success képernyő
+        document.querySelector('.email-wrapper').innerHTML = `
+          <div style="background:#1a1a1a;border-bottom:3px solid #f0a500;padding:22px 32px;">
+            <p style="margin:0;font-family:'Barlow Condensed',sans-serif;font-size:22px;font-weight:700;color:#fff;letter-spacing:3px;text-transform:uppercase;">SQM HUNGARY</p>
+          </div>
+          <div style="padding:60px 40px;text-align:center;">
+            <div style="width:64px;height:64px;background:#f0a500;border-radius:50%;display:flex;align-items:center;justify-content:center;margin:0 auto 24px auto;font-size:28px;font-weight:700;color:#1a1a1a;line-height:1;">✓</div>
+            <h2 style="font-family:'Barlow Condensed',sans-serif;font-size:26px;font-weight:700;color:#1a1a1a;letter-spacing:2px;text-transform:uppercase;margin:0 0 14px 0;">Köszönjük visszajelzését!</h2>
+            <p style="font-family:'Barlow',sans-serif;font-size:15px;color:#555;line-height:1.7;max-width:420px;margin:0 auto;">
+              Adatait rögzítettük. Kollégánk, <strong style="color:#1a1a1a;">{{OWNER_NEV}}</strong> hamarosan felveszi Önnel a kapcsolatot a végleges időpont egyeztetése érdekében.
+            </p>
+            <p style="margin:28px 0 0 0;font-family:'Barlow',sans-serif;font-size:12px;color:#aaa;">
+              Referencia: <strong>{{BID_SZAM}}</strong>
+            </p>
+          </div>
+          <div style="background:#111;padding:16px 32px;text-align:center;">
+            <p style="margin:0;font-family:'Barlow',sans-serif;font-size:10px;color:#444;letter-spacing:1px;">© 2026 SQM Hungary Kft.</p>
+          </div>
+        `;
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+      } else {
+        throw new Error('Szerver hiba: ' + resp.status);
+      }
+    } catch (err) {
+      btn.disabled = false;
+      btn.textContent = 'Visszajelzés küldése';
+      btn.style.opacity = '1';
+      document.getElementById('errorMsg').style.display = 'block';
+      console.error(err);
+    }
+  }
+</script>
+
+</body>
+</html>
