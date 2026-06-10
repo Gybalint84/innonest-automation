@@ -31,7 +31,7 @@ WEBAPP_URL     = os.environ.get(
     "https://script.google.com/macros/s/AKfycbyy1PQmHyBSlnWpXQR9bygVfFV_g2gJI9_7UjDI5zHm2xXElIX1DvsszM_UJu8l7too/exec"
 )
 PROCESSED_FILE = "/tmp/feldolgozott_megrendelesek.json"
-CHECK_INTERVAL = 300  # 5 perc
+CHECK_INTERVAL = 1800  # 30 perc
 
 
 # ── Feldolgozott BID-ek tárolása ──────────────────────────────────────────────
