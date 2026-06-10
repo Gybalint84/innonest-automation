@@ -6,6 +6,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Playwright böngésző telepítése
 RUN playwright install chromium
 COPY server.py .
+COPY innonest_core.py .
+COPY megrendeles_figyelő.py .
+COPY arajanlat_feltolto.py .
 COPY pipedrive_addon.py .
 COPY sablonok/ ./sablonok/
 EXPOSE 5000
