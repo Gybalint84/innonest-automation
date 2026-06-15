@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="hu">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SQM Árajánlat PDF generátor</title>
+<style>
+  * { box-sizing: border-box; font-family: 'Segoe UI', Arial, sans-serif; }
+  body {
+    background: #f4f4f4;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    margin: 0;
+  }
+  .card {
+    background: #fff;
+    border-radius: 12px;
+    box-shadow: 0 4px 24px rgba(0,0,0,.08);
+    padding: 28px 32px;
+    width: 360px;
+  }
+  h1 { font-size: 17px; margin: 0 0 4px; color: #2e2c2c; }
+  .sub { font-size: 12px; color: #888; margin: 0 0 20px; }
+  label { font-size: 13px; color: #555; display: block; margin-bottom: 6px; }
+  input[type=text] {
+    width: 100%; padding: 9px 11px; border: 1px solid #ddd;
+    border-radius: 8px; font-size: 14px; margin-bottom: 14px;
+  }
+  input[type=text]:focus { outline: none; border-color: #ffde1d; }
+  button {
+    width: 100%; padding: 11px; background: #2e2c2c; color: #ffde1d;
+    border: none; border-radius: 8px; font-size: 14px; font-weight: 700;
+    cursor: pointer;
+  }
+  button:disabled { opacity: .5; cursor: default; }
+  .status { margin-top: 18px; border-top: 1px solid #eee; padding-top: 14px; display: none; }
+  .step { display: flex; align-items: center; gap: 10px; font-size: 13px; margin-bottom: 9px; color: #999; }
+  .step.active { color: #2e2c2c; }
+  .step.done { color: #1a9e63; }
+  .dot {
+    width: 16px; height: 16px; border-radius: 50%; border: 2px solid currentColor;
+    flex-shrink: 0; display: flex; align-items: center; justify-content: center;
+    font-size: 10px; font-weight: 700;
+  }
+  .step.active .dot { animation: pulse 1s infinite; }
+  .step.done .dot::after { content: "✓"; }
+  @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .25 } }
+  a.link {
+    display: block; margin-top: 14px; font-size: 13px; color: #2e2c2c;
+    font-weight: 700; text-decoration: none; text-align: center;
+    padding: 10px; border: 2px solid #ffde1d; border-radius: 8px;
+  }
+  .meta { font-size: 11px; color: #999; margin-top: 4px; }
+  .error-box {
+    margin-top: 12px; font-size: 12px; color: #b3261e; background: #fdecec;
+    padding: 10px 12px; border-radius: 8px; display: none; line-height: 1.5;
+  }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Árajánlat PDF generátor</h1>
+  <p class="sub">Innonest BID alapján</p>
+
+  <label for="bid">BID szám</label>
+  <input type="text" id="bid" placeholder="BID-2026-185" autocomplete="off">
+  <button id="startBtn">PDF generálása</button>
+
+  <div class="status" id="status">
+    <div class="step" data-step="scraping"><div class="dot"></div>Adatok kiolvasása az Innonestből</div>
+    <div class="step" data-step="rendering"><div class="dot"></div>PDF renderelése</div>
+    <div class="step" data-step="uploading_innonest"><div class="dot"></div>Feltöltés az Innonestbe</div>
+    <div class="step" data-step="uploading_pipedrive"><div class="dot"></div>Csatolás a Pipedrive dealhez</div>
+    <a class="link" id="pdfLink" href="#" target="_blank" style="display:none;">PDF megnyitása</a>
+    <div class="meta" id="meta" style="display:none;"></div>
+  </div>
+  <div class="error-box" id="errorBox"></div>
+</div>
+
+<script>
+const ORDER = ["scraping", "rendering", "uploading_innonest", "uploading_pipedrive", "done"];
+
+const bidInput  = document.getElementById("bid");
+const btn       = document.getElementById("startBtn");
+const statusBox = document.getElementById("status");
+const errorBox  = document.getElementById("errorBox");
+const pdfLink   = document.getElementById("pdfLink");
+const metaBox   = document.getElementById("meta");
+
+function resetUI() {
+  errorBox.style.display = "none";
+  pdfLink.style.display = "none";
+  metaBox.style.display = "none";
+  statusBox.style.display = "block";
+  document.querySelectorAll(".step").forEach(s => s.className = "step");
+}
+
+function setSteps(currentStatus) {
+  const idx = ORDER.indexOf(currentStatus);
+  document.querySelectorAll(".step").forEach(s => {
+    const stepIdx = ORDER.indexOf(s.dataset.step);
+    s.className = "step";
+    if (stepIdx < idx || currentStatus === "done") s.classList.add("done");
+    else if (stepIdx === idx) s.classList.add("active");
+  });
+}
+
+async function poll(jobId) {
+  try {
+    const resp = await fetch(`/pdf-status/${jobId}`);
+    const data = await resp.json();
+
+    if (data.status === "error") {
+      errorBox.textContent = "Hiba: " + (data.message || "ismeretlen hiba");
+      errorBox.style.display = "block";
+      btn.disabled = false;
+      return;
+    }
+
+    setSteps(data.status);
+
+    if (data.status === "done") {
+      pdfLink.href = `/pdf-download/${jobId}`;
+      pdfLink.textContent = `PDF megnyitása – ${data.bid_szam || ""}`;
+      pdfLink.style.display = "block";
+
+      if (data.pipedrive && data.pipedrive.success === false) {
+        metaBox.textContent = "Figyelem: Pipedrive feltöltés sikertelen — " + (data.pipedrive.message || "");
+        metaBox.style.color = "#b3261e";
+      } else {
+        metaBox.textContent = `${data.ugyfel_nev || ""} — Innonestbe és Pipedrive-ba feltöltve`;
+        metaBox.style.color = "#999";
+      }
+      metaBox.style.display = "block";
+
+      btn.disabled = false;
+      return;
+    }
+
+    setTimeout(() => poll(jobId), 1500);
+  } catch (e) {
+    setTimeout(() => poll(jobId), 2000);
+  }
+}
+
+btn.addEventListener("click", async () => {
+  const bid = bidInput.value.trim().toUpperCase();
+  if (!/^BID-\d{4}-\d+$/.test(bid)) {
+    alert("Érvénytelen BID formátum. Példa: BID-2026-185");
+    return;
+  }
+
+  btn.disabled = true;
+  resetUI();
+
+  try {
+    const resp = await fetch("/generate-arajanlat-pdf", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ bid }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || "Ismeretlen hiba");
+
+    poll(data.job_id);
+  } catch (e) {
+    errorBox.textContent = e.message;
+    errorBox.style.display = "block";
+    btn.disabled = false;
+  }
+});
+
+bidInput.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") btn.click();
+});
+</script>
+</body>
+</html>
