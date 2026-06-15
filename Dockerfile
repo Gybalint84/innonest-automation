@@ -1,12 +1,13 @@
-# Microsoft hivatalos Playwright image – minden függőség előre telepítve van
-FROM mcr.microsoft.com/playwright/python:v1.52.0-jammy
+# Sima Python image (Docker Hub) – elkerüli a Microsoft Container Registry
+# (mcr.microsoft.com) jelenlegi 401-es hibáját, ami a Playwright base image-eket érinti.
+FROM python:3.11-slim-bookworm
 WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Playwright böngésző telepítése
-RUN playwright install chromium
+# Playwright Chromium + szükséges rendszer-függőségek telepítése
+RUN playwright install --with-deps chromium
 
 COPY server.py .
 COPY innonest_core.py .
