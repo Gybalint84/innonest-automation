@@ -3,11 +3,11 @@ server.py – SQM Hungary Innonest Automatizáció
 ===============================================
 Flask app belépési pont. Csak az inicializálást és a route regisztrációkat
 tartalmazza — az üzleti logika külön modulokban van:
-
   innonest_core.py        – Playwright alap (login, session, js_fill, tételkinyerő)
   megrendeles_figyelő.py  – 5 perces polling, megrendelés feldolgozás
   arajanlat_feltolto.py   – /create-arajanlat végpont
   pipedrive_addon.py      – Pipedrive webhook + visszajelzési rendszer
+  arajanlat_pdf.py        – /pdf-tool, Innonest BID alapú PDF generátor
 
 Környezeti változók (Railway → Variables):
   INNONEST_EMAIL          – Innonest bejelentkezési email
@@ -19,10 +19,8 @@ Környezeti változók (Railway → Variables):
   PIPEDRIVE_BID_FIELD_KEY – BID szám custom mező API kulcsa
   GOOGLE_SHEET_ID         – Fő Google Sheet azonosítója
 """
-
 import os
 import logging
-
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
@@ -36,15 +34,12 @@ log = logging.getLogger(__name__)
 # ── Flask app ─────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 CORS(app)
-
 API_KEY = os.environ.get("API_KEY", "titkos-kulcs")
 
 # ── Alap végpontok ────────────────────────────────────────────────────────────
-
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"})
-
 
 @app.route("/check-now", methods=["POST"])
 def check_now():
@@ -59,9 +54,7 @@ def check_now():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-
 # ── Modulok betöltése és route regisztráció ───────────────────────────────────
-
 # 1. Megrendelés figyelő háttérszál indítása
 from megrendeles_figyelő import start_figyelő
 start_figyelő()
@@ -74,9 +67,11 @@ register_arajanlat_routes(app)
 from pipedrive_addon import register_pipedrive_routes
 register_pipedrive_routes(app)
 
+# 4. Árajánlat PDF generátor regisztrálása (/pdf-tool)
+from arajanlat_pdf import register_pdf_routes
+register_pdf_routes(app)
 
 # ── Indítás ───────────────────────────────────────────────────────────────────
-
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
