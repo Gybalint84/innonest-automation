@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="hu">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SQM Árajánlat PDF generátor</title>
+<style>
+  * { box-sizing: border-box; font-family: 'Segoe UI', Arial, sans-serif; margin: 0; }
+  body { background: #f4f4f4; display: flex; align-items: flex-start; justify-content: center; min-height: 100vh; padding: 32px 16px; }
+  .card { background: #fff; border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,.08); padding: 28px 32px; width: 400px; }
+  h1 { font-size: 17px; margin: 0 0 4px; color: #2e2c2c; }
+  .sub { font-size: 12px; color: #888; margin: 0 0 20px; }
+  label { font-size: 13px; color: #555; display: block; margin-bottom: 6px; }
+  input[type=text], textarea {
+    width: 100%; padding: 9px 11px; border: 1px solid #ddd;
+    border-radius: 8px; font-size: 14px; font-family: inherit;
+  }
+  input[type=text] { margin-bottom: 14px; }
+  input[type=text]:focus, textarea:focus { outline: none; border-color: #ffde1d; }
+  textarea { resize: vertical; min-height: 140px; line-height: 1.6; color: #333; }
+  .btn-primary {
+    width: 100%; padding: 11px; background: #2e2c2c; color: #ffde1d;
+    border: none; border-radius: 8px; font-size: 14px; font-weight: 700; cursor: pointer;
+  }
+  .btn-primary:disabled { opacity: .45; cursor: default; }
+  .btn-send {
+    width: 100%; padding: 11px; background: #ffde1d; color: #2e2c2c;
+    border: none; border-radius: 8px; font-size: 14px; font-weight: 700;
+    cursor: pointer; margin-top: 10px;
+  }
+  .btn-send:disabled { opacity: .45; cursor: default; }
+  .status { margin-top: 18px; border-top: 1px solid #eee; padding-top: 14px; display: none; }
+  .step { display: flex; align-items: center; gap: 10px; font-size: 13px; margin-bottom: 9px; color: #bbb; }
+  .step.active { color: #2e2c2c; }
+  .step.done { color: #1a9e63; }
+  .step.skipped { color: #bbb; }
+  .dot { width: 16px; height: 16px; border-radius: 50%; border: 2px solid currentColor; flex-shrink: 0; display: flex; align-items: center; justify-content: center; font-size: 10px; font-weight: 700; }
+  .step.active .dot { animation: pulse 1s infinite; }
+  .step.done .dot::after { content: "✓"; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.25} }
+  .pdf-link {
+    display: flex; align-items: center; justify-content: center;
+    margin-top: 14px; font-size: 13px; color: #2e2c2c; font-weight: 700;
+    text-decoration: none; padding: 10px; border: 2px solid #ffde1d;
+    border-radius: 8px; gap: 6px;
+  }
+  .msg-section { margin-top: 16px; border-top: 1px solid #eee; padding-top: 14px; display: none; }
+  .msg-label { font-size: 12px; color: #888; margin-bottom: 6px; }
+  .meta { font-size: 11px; color: #999; margin-top: 8px; }
+  .warn { font-size: 12px; color: #b96a00; background: #fff8ee; border: 1px solid #ffd980; border-radius: 6px; padding: 8px 10px; margin-top: 8px; }
+  .error-box { margin-top: 12px; font-size: 12px; color: #b3261e; background: #fdecec; padding: 10px 12px; border-radius: 8px; display: none; line-height: 1.5; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Árajánlat PDF generátor</h1>
+  <p class="sub">Innonest BID alapján</p>
+
+  <label for="bid">BID szám</label>
+  <input type="text" id="bid" placeholder="BID-2026-185" autocomplete="off">
+  <button class="btn-primary" id="startBtn">PDF generálása</button>
+
+  <div class="status" id="status">
+    <div class="step" data-step="scraping"><div class="dot"></div>Adatok kiolvasása az Innonestből</div>
+    <div class="step" data-step="rendering"><div class="dot"></div>PDF renderelése</div>
+    <div class="step" data-step="uploading_innonest"><div class="dot"></div>Feltöltés az Innonestbe</div>
+    <div class="step" data-step="sending_email"><div class="dot"></div>Email küldése az értékesítőnek</div>
+    <a class="pdf-link" id="pdfLink" href="#" target="_blank" style="display:none;">
+      &#x2193; PDF megnyitása
+    </a>
+    <div class="meta" id="meta" style="display:none;"></div>
+  </div>
+
+  <div class="msg-section" id="msgSection">
+    <p class="msg-label">Üzenet az értékesítőnek <span style="color:#bbb">(szerkeszthető)</span></p>
+    <textarea id="msgBox"></textarea>
+    <button class="btn-send" id="sendBtn">Feltöltés az Innonestbe + küldés</button>
+  </div>
+
+  <div class="error-box" id="errorBox"></div>
+</div>
+
+<script>
+const ORDER  = ["scraping", "rendering", "uploading_innonest", "sending_email", "done"];
+const PHASE1 = ["scraping", "rendering"];
+
+const bidInput   = document.getElementById("bid");
+const startBtn   = document.getElementById("startBtn");
+const statusBox  = document.getElementById("status");
+const errorBox   = document.getElementById("errorBox");
+const pdfLink    = document.getElementById("pdfLink");
+const metaBox    = document.getElementById("meta");
+const msgSection = document.getElementById("msgSection");
+const msgBox     = document.getElementById("msgBox");
+const sendBtn    = document.getElementById("sendBtn");
+
+let currentJobId = null;
+
+function resetUI() {
+  errorBox.style.display = "none";
+  pdfLink.style.display = "none";
+  metaBox.style.display = "none";
+  msgSection.style.display = "none";
+  statusBox.style.display = "block";
+  document.querySelectorAll(".step").forEach(s => {
+    s.className = "step";
+  });
+}
+
+function setSteps(currentStatus) {
+  const idx = ORDER.indexOf(currentStatus);
+  document.querySelectorAll(".step").forEach(s => {
+    const si = ORDER.indexOf(s.dataset.step);
+    s.className = "step";
+    if (currentStatus === "done" || si < idx) s.classList.add("done");
+    else if (si === idx) s.classList.add("active");
+  });
+}
+
+async function poll(jobId) {
+  try {
+    const resp = await fetch("/pdf-status/" + jobId);
+    const data = await resp.json();
+
+    if (data.status === "error") {
+      errorBox.textContent = "Hiba: " + (data.message || "ismeretlen hiba");
+      errorBox.style.display = "block";
+      startBtn.disabled = false;
+      return;
+    }
+
+    // PDF kész — megmutatjuk a letöltési linket és az üzenet-szerkesztőt
+    if (data.status === "pdf_ready") {
+      setSteps("rendering");  // Steps 1+2 done
+      pdfLink.href = "/pdf-download/" + jobId;
+      pdfLink.textContent = "\u2193 PDF megnyitása \u2013 " + (data.bid_szam || "");
+      pdfLink.style.display = "flex";
+      msgBox.value = data.default_message || "";
+      msgSection.style.display = "block";
+      // Nem pollozunk tovább - várunk a sendBtn-re
+      return;
+    }
+
+    setSteps(data.status);
+
+    // PDF letölthető amint elkészül (uploading_innonest vagy késöbbi állapot)
+    if (data.pdf_path && pdfLink.style.display === "none") {
+      pdfLink.href = "/pdf-download/" + jobId;
+      pdfLink.textContent = "\u2193 PDF megnyitása \u2013 " + (data.bid_szam || "");
+      pdfLink.style.display = "flex";
+    }
+
+    if (data.status === "done") {
+      const emailOk  = data.email && data.email.success;
+      const innonestOk = data.innonest_ok !== false;
+
+      if (!innonestOk && !emailOk) {
+        metaBox.innerHTML = "<span style='color:#b3261e'>Innonest feltöltés és email küldés is sikertelen. PDF letölthető a fentről.</span>";
+      } else if (!innonestOk) {
+        metaBox.innerHTML = "<span style='color:#b96a00'>Figyelem: Innonest feltöltés sikertelen. Email elküldve: " + (data.email && data.email.owner_email || "") + "</span>";
+      } else if (!emailOk) {
+        metaBox.innerHTML = "<span style='color:#b96a00'>Figyelem: email küldés sikertelen. PDF Innonestbe feltöltve.</span>";
+      } else {
+        metaBox.textContent = (data.ugyfel_nev || "") + " \u2014 Innonestbe feltöltve, email elküldve: " + (data.email && data.email.owner_email || "");
+      }
+      metaBox.style.display = "block";
+      startBtn.disabled = false;
+      return;
+    }
+
+    setTimeout(() => poll(jobId), 1500);
+  } catch(e) {
+    setTimeout(() => poll(jobId), 2000);
+  }
+}
+
+startBtn.addEventListener("click", async () => {
+  const bid = bidInput.value.trim().toUpperCase();
+  if (!/^BID-\d{4}-\d+$/.test(bid)) {
+    alert("Érvénytelen BID formátum. Példa: BID-2026-185");
+    return;
+  }
+  startBtn.disabled = true;
+  resetUI();
+  try {
+    const resp = await fetch("/generate-arajanlat-pdf", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({bid})
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || "Ismeretlen hiba");
+    currentJobId = data.job_id;
+    poll(currentJobId);
+  } catch(e) {
+    errorBox.textContent = e.message;
+    errorBox.style.display = "block";
+    startBtn.disabled = false;
+  }
+});
+
+sendBtn.addEventListener("click", async () => {
+  if (!currentJobId) return;
+  sendBtn.disabled = true;
+  msgSection.querySelector(".msg-label").textContent = "Küldés folyamatban...";
+  try {
+    const resp = await fetch("/confirm-arajanlat-pdf/" + currentJobId, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({custom_message: msgBox.value})
+    });
+    if (!resp.ok) throw new Error("Hiba a küldés indításakor");
+    msgSection.style.display = "none";
+    poll(currentJobId);
+  } catch(e) {
+    errorBox.textContent = e.message;
+    errorBox.style.display = "block";
+    sendBtn.disabled = false;
+  }
+});
+
+bidInput.addEventListener("keydown", e => { if (e.key === "Enter") startBtn.click(); });
+</script>
+</body>
+</html>
