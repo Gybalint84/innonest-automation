@@ -406,10 +406,30 @@ async def _scrape_arajanlat(page, bid: str) -> dict:
         """
     )
 
-    netto = _to_float(netto_js) if netto_js else sum(_to_float(t["osszesen"]) for t in tetelek)
+    # Az Innonest összesítő mezői (fullTotalNett, fullTotalGross) ugyanolyan
+    # lazy render problémától szenvednek, mint a tételsoros nettPrice inputok —
+    # ha a viewport alatti sorok 0-val számolódtak be, az oldal összesítője is
+    # hibásan alacsony értéket mutat. Ezért a nettó összeget mindig a már
+    # javított tétellistából számítjuk, az Innonest oldaláról kiolvasott értéket
+    # csak fallback-ként használjuk, ha egyetlen tétel sem lett kiolvasva.
+    netto_from_items = sum(_to_float(t.get("osszesen", 0)) for t in tetelek)
+
+    if netto_from_items > 0:
+        netto = netto_from_items
+        log.info(f"[PDF] Nettó összeg tételekből számolva: {netto:,.0f} Ft")
+    else:
+        netto = _to_float(netto_js) if netto_js else 0
+        log.warning(f"[PDF] Nettó összeg Innonest oldalról kiolvasva (fallback): {netto:,.0f} Ft")
+
     if brutto_js:
         brutto = _to_float(brutto_js)
         afa = brutto - netto
+        # Ha a kiolvasott bruttó is hibás (lazy render), az ÁFA negatív lenne —
+        # ilyenkor visszaesünk a 27%-os becslésre
+        if afa < 0:
+            log.warning("[PDF] Kiolvasott bruttó hibásnak tűnik (ÁFA negatív), 27%-os ÁFA-val becsülve.")
+            afa = round(netto * 0.27, 2)
+            brutto = netto + afa
     else:
         afa = round(netto * 0.27, 2)
         brutto = netto + afa
