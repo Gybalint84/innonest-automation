@@ -67,6 +67,9 @@ register_pdf_routes(app)
 # 5. Pipedrive → webapp import pipeline regisztrálása
 from pipedrive_webapp import register_pipedrive_webapp_routes
 register_pipedrive_webapp_routes(app)
+# 6. Innonest darabszám-lekérdező végpont regisztrálása (/innonest-counters)
+from innonest_szamlalo import register_innonest_szamlalo_routes
+register_innonest_szamlalo_routes(app)
 # ── Indítás ───────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
