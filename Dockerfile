@@ -8,6 +8,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN playwright install --with-deps chromium
 COPY server.py .
 COPY innonest_core.py .
+COPY innonest_szamlalo.py .
 COPY megrendeles_figyelő.py .
 COPY arajanlat_feltolto.py .
 COPY pipedrive_addon.py .
