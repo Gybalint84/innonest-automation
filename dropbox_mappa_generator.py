@@ -52,6 +52,7 @@ KÖRNYEZETI VÁLTOZÓK (Railway) - ugyanabba a szervizbe, ahol a meglévők vann
 import os
 import re
 import logging
+import unicodedata
 from datetime import datetime
 
 import requests
@@ -65,7 +66,13 @@ DROPBOX_APP_SECRET = os.environ["DROPBOX_APP_SECRET"]
 DROPBOX_REFRESH_TOKEN = os.environ["DROPBOX_REFRESH_TOKEN"]
 # a szülőmappa, ami alá az almappák kerülnek - pl. "/Ügyfélképek"
 # (a Dropbox path-eknél nincs URL-encode, a sima ékezetes szöveget kell megadni)
-DROPBOX_PARENT_FOLDER = os.environ.get("DROPBOX_PARENT_FOLDER", "/Ügyfélképek").rstrip("/")
+# NFC normalizálás: Railway/böngésző env változó mezőkben előfordulhat, hogy az
+# ékezetes karakterek felbontott (NFD) formában kerülnek be (pl. "u" + önálló
+# umlaut-jel, ami vizuálisan ugyanúgy néz ki, mint az "ü", de bájtszinten más) -
+# ez a Dropbox API-nál "400 Bad Request"-et okozhat érvénytelen path miatt.
+DROPBOX_PARENT_FOLDER = unicodedata.normalize(
+    "NFC", os.environ.get("DROPBOX_PARENT_FOLDER", "/Ügyfélképek").strip()
+).rstrip("/")
 PIPEDRIVE_API_TOKEN = os.environ["PIPEDRIVE_API_TOKEN"]
 PIPEDRIVE_DROPBOX_FIELD_KEY = os.environ.get(
     "PIPEDRIVE_DROPBOX_FIELD_KEY", "8551443f0e9f59d2af653f3df5c12a05b0c432a7"
@@ -138,10 +145,16 @@ def mappanev_tisztitasa(nev):
     """Dropbox-ban tiltott/problémás karakterek eltávolítása a mappanévből.
     A Dropbox path-eknál a '/' tiltott, ezért csak azt és a felesleges
     szóközöket kezeljük - az ékezetes magyar karaktereket meghagyjuk,
-    a Dropbox ezekkel simán elboldogul."""
+    a Dropbox ezekkel simán elboldogul. NFC normalizálás: lásd a
+    DROPBOX_PARENT_FOLDER-nél írt megjegyzést a fájl elején - ugyanaz a
+    kódolási védőháló kell ide is, mert a cégnév Pipedrive-ból jön, ahol
+    szintén előfordulhat felbontott (NFD) ékezet-kódolás."""
+    nev = unicodedata.normalize("NFC", nev)
     nev = nev.replace("/", "-").replace("\\", "-")
     nev = re.sub(r'[<>:"|?*]', "", nev)
     nev = re.sub(r"\s+", " ", nev).strip()
+    # a Dropbox nem enged pontra vagy szóközre végződő path-elemet
+    nev = nev.rstrip(". ")
     return nev
 
 
@@ -173,8 +186,15 @@ def dropbox_mappa_letrehozasa(access_token, mappa_path):
         if "path" in hiba.get("error", {}) and "conflict" in str(hiba["error"]):
             logger.info("A mappa már létezett, folytatás megosztott link kéréssel: %s", mappa_path)
             return
-        raise RuntimeError(f"Dropbox mappa létrehozás hiba: {hiba}")
-    resp.raise_for_status()
+        raise RuntimeError(f"Dropbox mappa létrehozás hiba (409): {hiba}")
+    if not resp.ok:
+        # a resp.text tartalmazza a Dropbox pontos hibaindoklását (pl. "path/malformed_path")
+        # - ez sokkal többet mond, mint a puszta státuszkód
+        logger.error(
+            "Dropbox mappa létrehozás sikertelen (%s) path=%r válasz=%s",
+            resp.status_code, mappa_path, resp.text,
+        )
+        raise RuntimeError(f"Dropbox mappa létrehozás hiba ({resp.status_code}): {resp.text}")
 
 
 def dropbox_megosztott_link_letrehozasa(access_token, mappa_path):
@@ -209,7 +229,11 @@ def dropbox_megosztott_link_letrehozasa(access_token, mappa_path):
             return linkek[0]["url"]
         raise RuntimeError(f"Nem sikerült linket szerezni a mappához: {resp.json()}")
 
-    resp.raise_for_status()
+    logger.error(
+        "Dropbox megosztott link létrehozás sikertelen (%s) path=%r válasz=%s",
+        resp.status_code, mappa_path, resp.text,
+    )
+    raise RuntimeError(f"Dropbox link létrehozás hiba ({resp.status_code}): {resp.text}")
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +286,12 @@ def register_dropbox_routes(app):
         _folyamatban_levo_dealek.add(deal_id)
         try:
             return _deal_feldolgozasa(deal_id)
+        except Exception as e:
+            # a hiba szövegét a válaszba is betesszük, hogy a Pipedrive Automation
+            # "Execution history" nézetében is látszódjon - ne kelljen Railway
+            # logot nézni minden alkalommal
+            logger.exception("Hiba a deal %s feldolgozása közben", deal_id)
+            return jsonify({"error": str(e)}), 500
         finally:
             _folyamatban_levo_dealek.discard(deal_id)
 
