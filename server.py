@@ -9,6 +9,9 @@ tartalmazza — az üzleti logika külön modulokban van:
   pipedrive_addon.py      – Pipedrive webhook + visszajelzési rendszer
   arajanlat_pdf.py        – /pdf-tool, Innonest BID alapú PDF generátor
   pipedrive_webapp.py     – Pipedrive → webapp projekt import pipeline
+  innonest_szamlalo.py    – /innonest-counters, Innonest darabszám-lekérdező
+  dropbox_mappa_generator.py – /pipedrive-webhook/dropbox-mappa, Dropbox
+                                ügyfélmappa auto-generátor deal stage-hez kötve
 Környezeti változók (Railway → Variables):
   INNONEST_EMAIL          – Innonest bejelentkezési email
   INNONEST_PASSWORD       – Innonest jelszó
@@ -20,6 +23,12 @@ Környezeti változók (Railway → Variables):
   GOOGLE_SHEET_ID         – Fő Google Sheet azonosítója
   WEBAPP_BASE_URL         – SQM kalkulátor webapp URL-je (pl. https://sqm-hungary.hu/kalkulator/index.html)
   PD_WEBAPP_URL_FIELD     – Pipedrive deal custom field API key a kalkulátor URL visszaíráshoz
+  DROPBOX_APP_KEY             – Dropbox App key (App Console → Settings)
+  DROPBOX_APP_SECRET          – Dropbox App secret (App Console → Settings)
+  DROPBOX_REFRESH_TOKEN       – Dropbox refresh token (egyszeri OAuth flow eredménye)
+  DROPBOX_PARENT_FOLDER       – szülőmappa, ahova az új ügyfélmappák kerülnek (="/Ügyfélképek")
+  PIPEDRIVE_DROPBOX_FIELD_KEY – Pipedrive deal custom field API key a Dropbox URL visszaíráshoz
+  WEBHOOK_SHARED_SECRET       – opcionális, védi a Dropbox webhook végpontot (?secret=... paraméter)
 """
 import os
 import logging
@@ -70,6 +79,9 @@ register_pipedrive_webapp_routes(app)
 # 6. Innonest darabszám-lekérdező végpont regisztrálása (/innonest-counters)
 from innonest_szamlalo import register_innonest_szamlalo_routes
 register_innonest_szamlalo_routes(app)
+# 7. Dropbox mappa-generáló webhook regisztrálása (/pipedrive-webhook/dropbox-mappa)
+from dropbox_mappa_generator import register_dropbox_routes
+register_dropbox_routes(app)
 # ── Indítás ───────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
