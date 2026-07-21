@@ -14,6 +14,7 @@ COPY arajanlat_feltolto.py .
 COPY pipedrive_addon.py .
 COPY arajanlat_pdf.py .
 COPY pipedrive_webapp.py .
+COPY dropbox_mappa_generator.py .
 COPY sablonok/ ./sablonok/
 EXPOSE 5000
 CMD ["python", "server.py"]
