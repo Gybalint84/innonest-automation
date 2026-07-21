@@ -213,6 +213,26 @@ def dropbox_megosztott_link_letrehozasa(access_token, mappa_path):
 
 
 # ---------------------------------------------------------------------------
+# WEBHOOK PAYLOAD ÉRTELMEZÉS
+# ---------------------------------------------------------------------------
+
+def _deal_id_kinyerese(payload):
+    """Rugalmasan kinyeri a deal_id-t a webhook payloadból. A Pipedrive
+    Automations 'raw' JSON body-t a felhasználó saját maga állítja össze
+    a felületen, ezért többféle lehetséges szerkezetet is elfogadunk:
+      {"data": {"id": 123}}
+      {"current": {"id": 123}}
+      {"id": 123}
+      {"deal_id": 123}
+    """
+    for kulcs in ("data", "current"):
+        beagyazott = payload.get(kulcs)
+        if isinstance(beagyazott, dict) and beagyazott.get("id"):
+            return beagyazott.get("id")
+    return payload.get("id") or payload.get("deal_id")
+
+
+# ---------------------------------------------------------------------------
 # WEBHOOK ENDPOINT REGISZTRÁCIÓ
 # ---------------------------------------------------------------------------
 
@@ -228,10 +248,7 @@ def register_dropbox_routes(app):
                 return jsonify({"error": "unauthorized"}), 401
 
         payload = request.get_json(force=True, silent=True) or {}
-
-        # Pipedrive v1 Automation webhook payload szerkezete: current/previous objektum
-        deal = payload.get("current") or payload.get("data") or {}
-        deal_id = deal.get("id")
+        deal_id = _deal_id_kinyerese(payload)
 
         if not deal_id:
             logger.warning("Webhook payload nem tartalmaz deal id-t: %s", payload)
