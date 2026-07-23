@@ -4,44 +4,22 @@ server.py – SQM Hungary Innonest Automatizáció
 Flask app belépési pont. Csak az inicializálást és a route regisztrációkat
 tartalmazza — az üzleti logika külön modulokban van:
   innonest_core.py        – Playwright alap (login, session, js_fill, tételkinyerő)
-  megrendeles_figyelő.py  – 30 perces polling, megrendelés feldolgozás
-                              (SQM Megrendelés Feldolgozó Apps Script, webapp_v8.js)
+  megrendeles_figyelő.py  – 5 perces polling, megrendelés feldolgozás
   arajanlat_feltolto.py   – /create-arajanlat végpont
   pipedrive_addon.py      – Pipedrive webhook + visszajelzési rendszer
-                              (SQM Email Küldő Apps Script, webapp_email_v1.js)
   arajanlat_pdf.py        – /pdf-tool, Innonest BID alapú PDF generátor
   pipedrive_webapp.py     – Pipedrive → webapp projekt import pipeline
-  innonest_szamlalo.py    – /innonest-counters, Innonest darabszám-lekérdező
-  dropbox_mappa_generator.py – /pipedrive-webhook/dropbox-mappa, Dropbox
-                                ügyfélmappa auto-generátor deal stage-hez kötve
 Környezeti változók (Railway → Variables):
   INNONEST_EMAIL          – Innonest bejelentkezési email
   INNONEST_PASSWORD       – Innonest jelszó
   API_KEY                 – Titkos kulcs az /create-arajanlat és /check-now végpontokhoz
-  WEBAPP_SECRET           – Titkos kulcs a "SQM Megrendelés Feldolgozó" Apps
-                             Scripthez (webapp_v8.js) — megrendelés-figyelő
-                             Sheet-írás + setBidSzam fájlnév-visszaírás
-  WEBAPP_URL              – A "SQM Megrendelés Feldolgozó" Apps Script Web App URL-je
-  EMAIL_WEBAPP_SECRET     – Titkos kulcs az ÖNÁLLÓ "SQM Email Küldő" Apps
-                             Scripthez (webapp_email_v1.js) — ez KÜLÖN projekt/
-                             URL, nem ugyanaz, mint a WEBAPP_URL/WEBAPP_SECRET!
-  EMAIL_WEBAPP_URL        – A "SQM Email Küldő" Apps Script Web App URL-je
-                             (pipedrive_addon.py: sendEmail, PDFquotationSENDdealOWNER)
+  WEBAPP_SECRET           – Titkos kulcs a Google Apps Script Web App-hoz
+  WEBAPP_URL              – Google Apps Script Web App URL-je
   PIPEDRIVE_API_TOKEN     – Pipedrive személyes API token
   PIPEDRIVE_BID_FIELD_KEY – BID szám custom mező API kulcsa
+  GOOGLE_SHEET_ID         – Fő Google Sheet azonosítója
   WEBAPP_BASE_URL         – SQM kalkulátor webapp URL-je (pl. https://sqm-hungary.hu/kalkulator/index.html)
   PD_WEBAPP_URL_FIELD     – Pipedrive deal custom field API key a kalkulátor URL visszaíráshoz
-  DROPBOX_APP_KEY             – Dropbox App key (App Console → Settings)
-  DROPBOX_APP_SECRET          – Dropbox App secret (App Console → Settings)
-  DROPBOX_REFRESH_TOKEN       – Dropbox refresh token (egyszeri OAuth flow eredménye)
-  DROPBOX_PARENT_FOLDER       – szülőmappa, ahova az új ügyfélmappák kerülnek (="/Ügyfélképek")
-  PIPEDRIVE_DROPBOX_FIELD_KEY – Pipedrive deal custom field API key a Dropbox URL visszaíráshoz
-  WEBHOOK_SHARED_SECRET       – opcionális, védi a Dropbox webhook végpontot (?secret=... paraméter)
-
-  MEGSZŰNT (nem használt többé, törölhető a Railway Variables-ből):
-  GOOGLE_SHEET_ID         – a régi, Sheet-alapú visszajelzési rendszer emléke;
-                             a jelenlegi kódban sehol nem történik rá hivatkozás
-                             (a visszajelzési adatok Pipedrive note-okban élnek).
 """
 import os
 import logging
@@ -89,12 +67,12 @@ register_pdf_routes(app)
 # 5. Pipedrive → webapp import pipeline regisztrálása
 from pipedrive_webapp import register_pipedrive_webapp_routes
 register_pipedrive_webapp_routes(app)
-# 6. Innonest darabszám-lekérdező végpont regisztrálása (/innonest-counters)
-from innonest_szamlalo import register_innonest_szamlalo_routes
-register_innonest_szamlalo_routes(app)
-# 7. Dropbox mappa-generáló webhook regisztrálása (/pipedrive-webhook/dropbox-mappa)
+# 6. Dropbox mappa-generátor (írás: webhook) + "Fotók" menü (olvasás)
 from dropbox_mappa_generator import register_dropbox_routes
 register_dropbox_routes(app)
+# 7. Alvállalkozói beszerzési megrendelőlap (Innonest) regisztrálása
+from Innonest_alvallalkozo_beszermegrend import register_alv_megrendeles_routes
+register_alv_megrendeles_routes(app)
 # ── Indítás ───────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
