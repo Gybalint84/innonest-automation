@@ -8,13 +8,13 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN playwright install --with-deps chromium
 COPY server.py .
 COPY innonest_core.py .
-COPY innonest_szamlalo.py .
 COPY megrendeles_figyelő.py .
 COPY arajanlat_feltolto.py .
 COPY pipedrive_addon.py .
 COPY arajanlat_pdf.py .
 COPY pipedrive_webapp.py .
 COPY dropbox_mappa_generator.py .
+COPY Innonest_alvallalkozo_beszermegrend.py .
 COPY sablonok/ ./sablonok/
 EXPOSE 5000
 CMD ["python", "server.py"]
