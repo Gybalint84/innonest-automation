@@ -73,6 +73,12 @@ register_dropbox_routes(app)
 # 7. Alvállalkozói beszerzési megrendelőlap (Innonest) regisztrálása
 from Innonest_alvallalkozo_beszermegrend import register_alv_megrendeles_routes
 register_alv_megrendeles_routes(app)
+11a12
+innonest_szamlalo.py    – /innonest-counters, /innonest-full-data (Power BI Sync)
+75a77,79
+# 8. Innonest Ajánlatok/Megrendelések számláló (Power BI Sync – /innonest-counters, /innonest-full-data)
+from innonest_szamlalo import register_innonest_szamlalo_routes
+register_innonest_szamlalo_routes(app)
 # ── Indítás ───────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
