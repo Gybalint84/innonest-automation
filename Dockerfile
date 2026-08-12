@@ -17,5 +17,6 @@ COPY dropbox_mappa_generator.py .
 COPY Innonest_alvallalkozo_beszermegrend.py .
 COPY sablonok/ ./sablonok/
 COPY innonest_szamlalo.py .
+COPY billingo_teljesitmeny.py .
 EXPOSE 5000
 CMD ["python", "server.py"]
