@@ -9,6 +9,7 @@ tartalmazza — az üzleti logika külön modulokban van:
   pipedrive_addon.py      – Pipedrive webhook + visszajelzési rendszer
   arajanlat_pdf.py        – /pdf-tool, Innonest BID alapú PDF generátor
   pipedrive_webapp.py     – Pipedrive → webapp projekt import pipeline
+  innonest_szamlalo.py    – /innonest-counters, /innonest-full-data (Power BI Sync)
 Környezeti változók (Railway → Variables):
   INNONEST_EMAIL          – Innonest bejelentkezési email
   INNONEST_PASSWORD       – Innonest jelszó
@@ -73,9 +74,6 @@ register_dropbox_routes(app)
 # 7. Alvállalkozói beszerzési megrendelőlap (Innonest) regisztrálása
 from Innonest_alvallalkozo_beszermegrend import register_alv_megrendeles_routes
 register_alv_megrendeles_routes(app)
-11a12
-innonest_szamlalo.py    – /innonest-counters, /innonest-full-data (Power BI Sync)
-75a77,79
 # 8. Innonest Ajánlatok/Megrendelések számláló (Power BI Sync – /innonest-counters, /innonest-full-data)
 from innonest_szamlalo import register_innonest_szamlalo_routes
 register_innonest_szamlalo_routes(app)
