@@ -81,6 +81,8 @@ register_teljesitmeny_routes(app)
 # 9. Innonest Ajánlatok/Megrendelések számláló (Power BI Sync – /innonest-counters, /innonest-full-data)
 from innonest_szamlalo import register_innonest_szamlalo_routes
 register_innonest_szamlalo_routes(app)
+from szamla_ellenorzo import register_szamla_routes
+register_szamla_routes(app)
 # ── Indítás ───────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
