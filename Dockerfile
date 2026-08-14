@@ -15,6 +15,7 @@ COPY arajanlat_pdf.py .
 COPY pipedrive_webapp.py .
 COPY dropbox_mappa_generator.py .
 COPY Innonest_alvallalkozo_beszermegrend.py .
+COPY szamla_ellenorzo.py .
 COPY sablonok/ ./sablonok/
 COPY innonest_szamlalo.py .
 COPY billingo_teljesitmeny.py .
