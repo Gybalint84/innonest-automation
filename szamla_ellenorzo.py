@@ -26,19 +26,27 @@ Környezeti változók (a meglévőkön felül nem igényel újat):
     WEBAPP_URL, WEBAPP_SECRET       – a "Megrendelt projektek" webapp (webapp_v8.js)
     EMAIL_WEBAPP_URL, EMAIL_WEBAPP_SECRET – a különálló email-küldő webapp
 
-ÉLES ELLENŐRZÉS SZÜKSÉGES:
-  - Az Innonest /acquisition (beszerzési megrendelők) lista oldal pontos
-    táblázat-szerkezete nincs feltérképezve (csak az /acquisition/add
-    kitöltő oldal). A get_beszerzesi_megrendelok() ezért ugyanazt az
-    "univerzális sor-scraping" technikát használja, mint a
-    megrendeles_figyelő.py get_megrendelt_tetelek()-je — élesben
-    valószínűleg finomítani kell a szelektorokat/regexeket.
+ÉLESBEN ELLENŐRIZVE (2026-08-15):
+  - Az Innonest /acquisition lista + a sorhoz tartozó "my-modal" AJAX-részlet
+    szerkezete élesben feltérképezve és ez alapján implementálva (lásd
+    _get_beszerzesi_sorok / _nyisd_meg_reszletek). A "Megrendelt projektek"
+    Sheet (webapp_sheet forrás) FONTOS KORLÁTJA: az ÜGYFÉL-oldali
+    árajánlat-elfogadásokat rögzíti (megrendeles_figyelő.py tölti), NEM a
+    beszállítói/alvállalkozói beszerzési megrendelőket — tehát ez a forrás
+    csak akkor releváns, ha a bejövő számla kiállítója maga is egy Innonestes
+    BID-hez kötött vevői visszaigazolást jelent, ami a legtöbb beszállítói
+    számlánál NEM áll fenn. Érdemes újragondolni, hogy ez a forrás egyáltalán
+    releváns-e a beszállítói számla-ellenőrzési láncban.
   - A Pipedrive BID-alapú keresés a /v1/deals/search endpointot használja
-    (term = BID szám) — ez sosem lett még élesben tesztelve ebben a
-    projektben, érdemes 1-2 valós BID-del ellenőrizni.
+    (term = BID szám), és a deal ÖSSZ-értékét veti össze a számlával — ez
+    viszont az ÜGYFÉLNEK adott ajánlat értéke, NEM az alvállalkozói költség.
+    A pontosabb ellenőrzéshez a deal "Alvállalkozók" / "Alvállalkozó
+    feladatok részletezése" egyedi mezőit kellene nézni (lásd
+    pipedrive_addon.py alv_bontas_parse()) — ez még nincs bekötve ide.
 """
 
 import os
+import re
 import json
 import time
 import uuid
@@ -116,71 +124,117 @@ def _save_esetek(esetek: dict):
 # 1. FORRÁS – INNONEST BESZERZÉSI MEGRENDELŐK
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def _get_beszerzesi_megrendelok(page) -> list:
+async def _get_beszerzesi_sorok(page) -> list:
     """
-    Az /acquisition lista oldalról kinyeri a meglévő beszerzési megrendelőket.
-    Univerzális sor-scraping (ua. technika, mint megrendeles_figyelő.py
-    get_megrendelt_tetelek()-je) — ÉLES ELLENŐRZÉS SZÜKSÉGES, lásd fájl fejléc.
-    """
-    import re
+    Az /acquisition lista oldalról kinyeri a meglévő beszerzési megrendelők
+    ALAP adatait (élesben feltérképezett szerkezet alapján — 2026-08-15-én
+    manuálisan ellenőrizve a valódi Innonest felületen):
 
+    Minden sor (table.table-softservice tr) szövege kb. így néz ki:
+        KIV
+        2026-113
+        217 m2 ESD Csúszásmentes ... [Árajánlat KIV #BID-2026-137]   <- tárgy
+        Sto Építőanyag Kft.                                          <- beszállító (lista-nézetben)
+        0
+        0
+        2026-08-13 2026-08-10 Összeállítás alatt
+
+    A sorban van egy <a class="my-modal" href=".../worksheets_pdf/open/<id>.html">
+    link, amire kattintva egy .modal.in ablak nyílik AJAX-szal — ebben van a
+    pontos beszállító név (h3) és a nettó összeg (.details-box.db-m .details-box-text).
+    Az összeg a LISTÁBAN NEM látszik, csak a modálban — ezért csak a BID/cégnév
+    alapján valószínű jelöltekhez nyitjuk meg a modált (lásd _innonest_ellenorzes_async).
+    """
     await page.goto(ACQUISITION_URL, wait_until="networkidle")
     await page.wait_for_timeout(1500)
 
     sorok_raw = await page.evaluate(
-        "() => { "
-        "  var eredmeny = []; "
-        "  var sorok = document.querySelectorAll('tr, .list-item'); "
-        "  sorok.forEach(function(sor) { "
-        "    var szoveg = sor.innerText || ''; "
-        "    var linkek = []; "
-        "    var as = sor.querySelectorAll('a[href]'); "
-        "    for (var i=0; i<as.length; i++) { linkek.push(as[i].getAttribute('href') || ''); } "
-        "    eredmeny.push({szoveg: szoveg, link: linkek[0] || ''}); "
-        "  }); "
-        "  return eredmeny; "
-        "}"
+        """
+        () => {
+            const eredmeny = [];
+            document.querySelectorAll('table.table-softservice tr').forEach(tr => {
+                const szoveg = (tr.innerText || '').trim();
+                if (!szoveg) return;
+                const link = tr.querySelector('a.my-modal[href*="worksheets_pdf"]');
+                eredmeny.push({
+                    szoveg: szoveg,
+                    href: link ? link.getAttribute('href') : ''
+                });
+            });
+            return eredmeny;
+        }
+        """
     )
 
     tetelek = []
     for sor in sorok_raw:
         szoveg = sor.get("szoveg", "")
-        if not szoveg or len(szoveg.strip()) < 3:
-            continue
-
-        bid_match = re.search(r"BID-[0-9]{4}-[0-9]+", szoveg)
-        bid = bid_match.group(0) if bid_match else ""
-
-        osszeg = None
-        penznem = "HUF"
-        penz_m = re.search(r"([0-9][0-9 ]{2,}[0-9])\s*(HUF|EUR|USD|GBP|CHF)", szoveg)
-        if penz_m:
-            try:
-                osszeg = int(penz_m.group(1).replace(" ", ""))
-                penznem = penz_m.group(2)
-            except Exception:
-                pass
+        href = sor.get("href", "")
+        if not href:
+            continue  # nincs megnyitható részlet — nem tudjuk ellenőrizni
 
         sorok_lista = [s.strip() for s in szoveg.splitlines() if s.strip()]
-        cegnev_jeloltek = [
-            s for s in sorok_lista
-            if not re.match(r"^\d{4}-\d{2}-\d{2}", s)
-            and not re.search(r"HUF|EUR|USD|GBP|CHF", s)
-            and not re.match(r"^[\d\s\.,]+$", s)
-            and len(s) > 3
-        ]
+        # Séma: [0]="KIV" jelölés, [1]=sorszám, [2]=tárgy, [3]=beszállító (lista-nézet), ...
+        targya = sorok_lista[2] if len(sorok_lista) > 2 else ""
+        beszallito_lista = sorok_lista[3] if len(sorok_lista) > 3 else ""
+
+        bid_match = re.search(r"BID-\s?[0-9]{4}-\s?[0-9]+", targya) or re.search(r"BID-\s?[0-9]{4}-\s?[0-9]+", szoveg)
+        bid = re.sub(r"\s", "", bid_match.group(0)) if bid_match else ""
 
         tetelek.append({
             "bid": bid,
-            "cegnev_jeloltek": cegnev_jeloltek,
-            "osszeg": osszeg,
-            "penznem": penznem,
-            "nyers_szoveg": szoveg[:300],
-            "link": sor.get("link", ""),
+            "targya": targya,
+            "beszallito_lista": beszallito_lista,
+            "href": href,
         })
 
-    log.info(f"[SZAMLA-ELLENORZO] Innonest /acquisition: {len(tetelek)} sor beolvasva")
+    log.info(f"[SZAMLA-ELLENORZO] Innonest /acquisition: {len(tetelek)} sor beolvasva (href-fel)")
     return tetelek
+
+
+async def _nyisd_meg_reszletek(page, href: str) -> dict:
+    """
+    A lista-sor 'my-modal' linkjére kattint, kiolvassa a felugró modál pontos
+    beszállító nevét (h3) és a nettó összeget (.details-box.db-m .details-box-text),
+    majd bezárja a modált (hogy a következő sor is nyitható legyen ugyanazon az oldalon).
+    """
+    try:
+        link = page.locator(f'a.my-modal[href="{href}"]').first
+        if await link.count() == 0:
+            return {}
+        await link.scroll_into_view_if_needed()
+        await link.click()
+        await page.wait_for_selector(".modal.in", timeout=8000)
+        await page.wait_for_timeout(500)
+
+        adat = await page.evaluate(
+            """
+            () => {
+                const modal = document.querySelector('.modal.in');
+                if (!modal) return null;
+                const h3 = modal.querySelector('h3');
+                const nettoBox = modal.querySelector('.details-box.db-m .details-box-text');
+                return {
+                    beszallito: h3 ? h3.innerText.trim() : '',
+                    netto_szoveg: nettoBox ? nettoBox.innerText.trim() : '',
+                };
+            }
+            """
+        )
+
+        await page.evaluate(
+            """
+            () => {
+                const btn = document.querySelector('.modal.in .close, .modal.in button[data-dismiss="modal"]');
+                if (btn) btn.click();
+            }
+            """
+        )
+        await page.wait_for_timeout(400)
+        return adat or {}
+    except Exception as e:
+        log.warning(f"[SZAMLA-ELLENORZO] Beszerzési megrendelő részlet megnyitása hiba ({href}): {e}")
+        return {}
 
 
 async def _innonest_ellenorzes_async(bid: str, cegnev: str, osszeg) -> dict:
@@ -194,36 +248,65 @@ async def _innonest_ellenorzes_async(bid: str, cegnev: str, osszeg) -> dict:
         await page.wait_for_timeout(1000)
         if "login" in page.url:
             await login(page)
+            await page.goto(ACQUISITION_URL, wait_until="networkidle")
+            await page.wait_for_timeout(1000)
 
-        tetelek = await _get_beszerzesi_megrendelok(page)
-        await browser.close()
+        sorok = await _get_beszerzesi_sorok(page)
 
-    talalat = None
-    for t in tetelek:
-        if bid and t.get("bid") == bid:
-            talalat = t
+        # Jelöltek: elsősorban BID-egyezés; ha nincs BID vagy nincs rá találat,
+        # a lista-nézeti beszállító-név alapján is próbálkozunk (max 5 jelölt,
+        # hogy ne nyissunk meg fölöslegesen sok modált).
+        jeloltek = [s for s in sorok if bid and s.get("bid") == bid]
+        if not jeloltek and cegnev:
+            cn = cegnev.strip().lower()
+            jeloltek = [s for s in sorok if cn in s.get("beszallito_lista", "").lower()][:5]
+
+        talalat = None
+        for jelolt in jeloltek:
+            reszlet = await _nyisd_meg_reszletek(page, jelolt["href"])
+            if not reszlet:
+                continue
+            egyesitett = {**jelolt, **reszlet}
+            if cegnev and cegnev.strip().lower() not in egyesitett.get("beszallito", "").lower():
+                # Ugyanahhoz a BID-hez több beszállító is tartozhat (pl. anyag +
+                # alvállalkozó) — ha ez a sor másik beszállítóé, tovább nézzük a többit.
+                if talalat is None:
+                    talalat = egyesitett  # tartalék, ha végül nem lesz jobb találat
+                continue
+            talalat = egyesitett
             break
-    if not talalat and cegnev:
-        for t in tetelek:
-            if any(cegnev.strip().lower() in c.lower() for c in t.get("cegnev_jeloltek", [])):
-                talalat = t
-                break
+
+        await browser.close()
 
     if not talalat:
         return {"talalat": False, "reszletek": None, "hiba": None}
 
+    netto_szoveg = talalat.get("netto_szoveg", "")
+    netto_ertek = None
+    m = re.search(r"([\d\s]+)\s*HUF", netto_szoveg)
+    if m:
+        try:
+            netto_ertek = int(m.group(1).replace(" ", ""))
+        except Exception:
+            pass
+
     osszeg_egyezik = None
-    if osszeg is not None and talalat.get("osszeg") is not None:
-        osszeg_egyezik = (int(osszeg) == int(talalat["osszeg"]))
+    if osszeg is not None and netto_ertek is not None:
+        osszeg_egyezik = (int(osszeg) == netto_ertek)
+
+    cegnev_egyezik = None
+    if cegnev:
+        cegnev_egyezik = cegnev.strip().lower() in (talalat.get("beszallito", "") or "").lower()
 
     return {
         "talalat": True,
         "reszletek": {
             "bid": talalat.get("bid"),
-            "osszeg": talalat.get("osszeg"),
-            "penznem": talalat.get("penznem"),
+            "beszallito": talalat.get("beszallito"),
+            "osszeg": netto_ertek,
+            "penznem": "HUF",
             "osszeg_egyezik": osszeg_egyezik,
-            "nyers_szoveg": talalat.get("nyers_szoveg"),
+            "cegnev_egyezik": cegnev_egyezik,
         },
         "hiba": None,
     }
@@ -242,9 +325,20 @@ def innonest_ellenorzes(bid: str, cegnev: str, osszeg) -> dict:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def pipedrive_ellenorzes(bid: str, cegnev: str, osszeg) -> dict:
+    """
+    A BID alapján megkeresi a Pipedrive dealt, majd az "Alvállalkozó feladatok
+    részletezése" egyedi mezőt (PIPEDRIVE_TASKDETAIL_FIELD) elemzi a
+    pipedrive_addon.py-ban már meglévő alv_bontas_parse()-szal — ez adja meg,
+    melyik alvállalkozóra mennyi költség lett rögzítve az adott projekten.
+    FONTOS: NEM a deal teljes értékét (az ügyfélnek adott árat) hasonlítjuk
+    össze a számlával, hanem a cégnévhez tartozó alvállalkozói részösszeget,
+    ha az szerepel a bontásban.
+    """
     if not bid:
         return {"talalat": False, "reszletek": None, "hiba": "Nincs BID szám, nem kereshető"}
     try:
+        from pipedrive_addon import alv_bontas_parse, PIPEDRIVE_TASKDETAIL_FIELD
+
         r = requests.get(
             "https://api.pipedrive.com/v1/deals/search",
             params={"api_token": PIPEDRIVE_API_TOKEN, "term": bid, "fields": "custom_fields", "exact_match": "true"},
@@ -255,23 +349,59 @@ def pipedrive_ellenorzes(bid: str, cegnev: str, osszeg) -> dict:
         if not talalatok:
             return {"talalat": False, "reszletek": None, "hiba": None}
 
-        deal = talalatok[0].get("item", {})
-        deal_ertek = deal.get("value")
-        osszeg_egyezik = None
-        if osszeg is not None and deal_ertek is not None:
-            try:
-                osszeg_egyezik = (int(osszeg) == int(float(deal_ertek)))
-            except Exception:
-                osszeg_egyezik = None
+        deal_id = talalatok[0].get("item", {}).get("id")
+        deal_r = requests.get(
+            f"https://api.pipedrive.com/v1/deals/{deal_id}",
+            params={"api_token": PIPEDRIVE_API_TOKEN}, timeout=15,
+        )
+        deal_data = deal_r.json()
+        deal = deal_data.get("data") or {}
 
+        alv_raw = str(deal.get(PIPEDRIVE_TASKDETAIL_FIELD) or "").strip()
+        alv_groups = alv_bontas_parse(alv_raw) if alv_raw else {}
+
+        talalt_alv = None
+        if cegnev:
+            cn = cegnev.strip().lower()
+            for nev, adat in alv_groups.items():
+                if cn in nev.lower() or nev.lower() in cn:
+                    talalt_alv = (nev, adat)
+                    break
+
+        if talalt_alv:
+            nev, adat = talalt_alv
+            osszesen_szam = None
+            m = re.search(r"([\d\s]+)", adat.get("osszesen", ""))
+            if m:
+                try:
+                    osszesen_szam = int(m.group(1).replace(" ", ""))
+                except Exception:
+                    pass
+            osszeg_egyezik = None
+            if osszeg is not None and osszesen_szam is not None:
+                osszeg_egyezik = (int(osszeg) == osszesen_szam)
+            return {
+                "talalat": True,
+                "reszletek": {
+                    "deal_id": deal_id,
+                    "deal_nev": deal.get("title"),
+                    "alvallalkozo": nev,
+                    "alvallalkozo_osszesen": osszesen_szam,
+                    "osszeg_egyezik": osszeg_egyezik,
+                },
+                "hiba": None,
+            }
+
+        # A deal létezik, de a cégnév nem szerepel az alvállalkozói bontásban —
+        # ez önmagában GYANÚS jelnek számít (a Cowork-oldal döntse el, hogyan
+        # kezeli), de technikai hibának nem tekintjük.
         return {
             "talalat": True,
             "reszletek": {
-                "deal_id": deal.get("id"),
+                "deal_id": deal_id,
                 "deal_nev": deal.get("title"),
-                "deal_ertek": deal_ertek,
-                "osszeg_egyezik": osszeg_egyezik,
-                "status": deal.get("status"),
+                "alvallalkozo": None,
+                "megjegyzes": "A cégnév nem szerepel az alvállalkozói feladatbontásban ezen a dealen.",
             },
             "hiba": None,
         }
