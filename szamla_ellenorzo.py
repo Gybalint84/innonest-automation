@@ -139,11 +139,16 @@ async def _get_beszerzesi_sorok(page) -> list:
         0
         2026-08-13 2026-08-10 Összeállítás alatt
 
-    A sorban van egy <a class="my-modal" href=".../worksheets_pdf/open/<id>.html">
-    link, amire kattintva egy .modal.in ablak nyílik AJAX-szal — ebben van a
-    pontos beszállító név (h3) és a nettó összeg (.details-box.db-m .details-box-text).
-    Az összeg a LISTÁBAN NEM látszik, csak a modálban — ezért csak a BID/cégnév
-    alapján valószínű jelöltekhez nyitjuk meg a modált (lásd _innonest_ellenorzes_async).
+    JAVÍTVA (2026-08-15, élő teszt alapján): a sorban KÉT különálló <a> van —
+      1) <a href=".../worksheets_pdf/open/<id>.html">  (osztály nélkül) — ez a
+         munkalap-azonosítót hordozza, DE nem nyit modált, hanem egy PDF-oldalra
+         navigálna.
+      2) <a class="my-modal ..." href="javascript:;">  — EZ nyitja meg ténylegesen
+         a részletes AJAX-modált, de az href-je nem egyedi ("javascript:;" minden
+         sorban), ezért nem lehet vele közvetlenül azonosítani egy sort.
+    Ezért az egyedi azonosítót (a worksheets_pdf/open/<id> számából) tároljuk, és a
+    modál megnyitásakor a sort EZEN az azonosítón keresztül találjuk meg újra,
+    majd a soron BELÜLI '.my-modal' gombra kattintunk (lásd _nyisd_meg_reszletek).
     """
     await page.goto(ACQUISITION_URL, wait_until="networkidle")
     await page.wait_for_timeout(1500)
@@ -155,10 +160,12 @@ async def _get_beszerzesi_sorok(page) -> list:
             document.querySelectorAll('table.table-softservice tr').forEach(tr => {
                 const szoveg = (tr.innerText || '').trim();
                 if (!szoveg) return;
-                const link = tr.querySelector('a.my-modal[href*="worksheets_pdf"]');
+                const pdfLink = tr.querySelector('a[href*="worksheets_pdf/open/"]');
+                const modalBtn = tr.querySelector('a.my-modal, .my-modal');
                 eredmeny.push({
                     szoveg: szoveg,
-                    href: link ? link.getAttribute('href') : ''
+                    pdf_href: pdfLink ? pdfLink.getAttribute('href') : '',
+                    van_modal_gomb: !!modalBtn,
                 });
             });
             return eredmeny;
@@ -169,9 +176,14 @@ async def _get_beszerzesi_sorok(page) -> list:
     tetelek = []
     for sor in sorok_raw:
         szoveg = sor.get("szoveg", "")
-        href = sor.get("href", "")
-        if not href:
-            continue  # nincs megnyitható részlet — nem tudjuk ellenőrizni
+        pdf_href = sor.get("pdf_href", "")
+        if not pdf_href or not sor.get("van_modal_gomb"):
+            continue  # nincs azonosítható / megnyitható részlet — nem tudjuk ellenőrizni
+
+        azon_match = re.search(r"worksheets_pdf/open/(\d+)", pdf_href)
+        azonosito = azon_match.group(1) if azon_match else ""
+        if not azonosito:
+            continue
 
         sorok_lista = [s.strip() for s in szoveg.splitlines() if s.strip()]
         # Séma: [0]="KIV" jelölés, [1]=sorszám, [2]=tárgy, [3]=beszállító (lista-nézet), ...
@@ -185,21 +197,28 @@ async def _get_beszerzesi_sorok(page) -> list:
             "bid": bid,
             "targya": targya,
             "beszallito_lista": beszallito_lista,
-            "href": href,
+            "azonosito": azonosito,
         })
 
-    log.info(f"[SZAMLA-ELLENORZO] Innonest /acquisition: {len(tetelek)} sor beolvasva (href-fel)")
+    log.info(f"[SZAMLA-ELLENORZO] Innonest /acquisition: {len(tetelek)} sor beolvasva (azonosítóval)")
     return tetelek
 
 
-async def _nyisd_meg_reszletek(page, href: str) -> dict:
+async def _nyisd_meg_reszletek(page, azonosito: str) -> dict:
     """
-    A lista-sor 'my-modal' linkjére kattint, kiolvassa a felugró modál pontos
+    A lista-sort a worksheets_pdf/open/<azonosito> linkje alapján azonosítja
+    újra, majd a SORON BELÜLI '.my-modal' gombra kattint (ez nyitja meg a
+    felugró AJAX-modált — az href="javascript:;" ezen a gombon, ezért nem
+    lehetett közvetlenül vele azonosítani a sort). Kiolvassa a modál pontos
     beszállító nevét (h3) és a nettó összeget (.details-box.db-m .details-box-text),
     majd bezárja a modált (hogy a következő sor is nyitható legyen ugyanazon az oldalon).
     """
     try:
-        link = page.locator(f'a.my-modal[href="{href}"]').first
+        pdf_link = page.locator(f'a[href*="worksheets_pdf/open/{azonosito}"]').first
+        if await pdf_link.count() == 0:
+            return {}
+        row = pdf_link.locator("xpath=ancestor::tr[1]")
+        link = row.locator("a.my-modal, .my-modal").first
         if await link.count() == 0:
             return {}
         await link.scroll_into_view_if_needed()
@@ -233,7 +252,7 @@ async def _nyisd_meg_reszletek(page, href: str) -> dict:
         await page.wait_for_timeout(400)
         return adat or {}
     except Exception as e:
-        log.warning(f"[SZAMLA-ELLENORZO] Beszerzési megrendelő részlet megnyitása hiba ({href}): {e}")
+        log.warning(f"[SZAMLA-ELLENORZO] Beszerzési megrendelő részlet megnyitása hiba (azonosito={azonosito}): {e}")
         return {}
 
 
@@ -263,7 +282,7 @@ async def _innonest_ellenorzes_async(bid: str, cegnev: str, osszeg) -> dict:
 
         talalat = None
         for jelolt in jeloltek:
-            reszlet = await _nyisd_meg_reszletek(page, jelolt["href"])
+            reszlet = await _nyisd_meg_reszletek(page, jelolt["azonosito"])
             if not reszlet:
                 continue
             egyesitett = {**jelolt, **reszlet}
