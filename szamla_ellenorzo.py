@@ -206,12 +206,19 @@ async def _get_beszerzesi_sorok(page) -> list:
 
 async def _nyisd_meg_reszletek(page, azonosito: str) -> dict:
     """
-    A lista-sort a worksheets_pdf/open/<azonosito> linkje alapján azonosítja
-    újra, majd a SORON BELÜLI '.my-modal' gombra kattint (ez nyitja meg a
-    felugró AJAX-modált — az href="javascript:;" ezen a gombon, ezért nem
-    lehetett közvetlenül vele azonosítani a sort). Kiolvassa a modál pontos
-    beszállító nevét (h3) és a nettó összeget (.details-box.db-m .details-box-text),
-    majd bezárja a modált (hogy a következő sor is nyitható legyen ugyanazon az oldalon).
+    KÉTLÉPÉSES modál-navigáció (élesben feltérképezve 2026-08-15-én):
+      1) A lista-sort a worksheets_pdf/open/<azonosito> linkje alapján azonosítja
+         újra, majd a SORON BELÜLI '.my-modal' gombra kattint (href="javascript:;",
+         ezért nem lehetett közvetlenül vele azonosítani a sort). Ez NEM a részletes
+         adatlapot nyitja meg, hanem egy "előzmények" listát (#ws_history_list) —
+         a beszerzési megrendelőhöz tartozó dokumentum(ok) listáját.
+      2) Az előzmény-modálban BELÜL van egy második
+         <a class="my-modal" data-href=".../worksheets/details/<id>">
+         link — EZT kell megnyitni ahhoz, hogy a valódi részletes adatlap
+         (beszállító neve, elérhetőségek, tételek, nettó összeg) megjelenjen.
+    A nettó összeget a modál teljes szövegéből, reguláris kifejezéssel keressük
+    ki (nem egy fix selectorral), mert a "Ft"/"HUF" összeg helye a felületen
+    változhat a megrendelő típusától függően.
     """
     try:
         pdf_link = page.locator(f'a[href*="worksheets_pdf/open/{azonosito}"]').first
@@ -226,26 +233,35 @@ async def _nyisd_meg_reszletek(page, azonosito: str) -> dict:
         await page.wait_for_selector(".modal.in", timeout=8000)
         await page.wait_for_timeout(500)
 
+        # 2. lépés: az előzmény-modálon belüli konkrét dokumentum-link megnyitása
+        detail_link = page.locator('.modal.in a.my-modal[data-href*="worksheets/details"]').first
+        if await detail_link.count() > 0:
+            await detail_link.click()
+            await page.wait_for_timeout(1200)
+
         adat = await page.evaluate(
             """
             () => {
-                const modal = document.querySelector('.modal.in');
+                const modals = document.querySelectorAll('.modal.in');
+                const modal = modals[modals.length - 1];
                 if (!modal) return null;
                 const h3 = modal.querySelector('h3');
-                const nettoBox = modal.querySelector('.details-box.db-m .details-box-text');
+                const fullText = modal.innerText || '';
                 return {
                     beszallito: h3 ? h3.innerText.trim() : '',
-                    netto_szoveg: nettoBox ? nettoBox.innerText.trim() : '',
+                    netto_szoveg: fullText,
                 };
             }
             """
         )
 
+        # Az összes nyitott modált bezárjuk, hogy a következő sor is nyitható
+        # legyen ugyanazon az oldalon (mindkét szintet: részlet + előzmény).
         await page.evaluate(
             """
             () => {
-                const btn = document.querySelector('.modal.in .close, .modal.in button[data-dismiss="modal"]');
-                if (btn) btn.click();
+                document.querySelectorAll('.modal.in .close, .modal.in button[data-dismiss="modal"]')
+                    .forEach(btn => btn.click());
             }
             """
         )
@@ -271,6 +287,15 @@ async def _innonest_ellenorzes_async(bid: str, cegnev: str, osszeg) -> dict:
             await page.wait_for_timeout(1000)
 
         sorok = await _get_beszerzesi_sorok(page)
+        if not sorok:
+            # Az Innonest /acquisition oldal időnként üresen tér vissza (élesben
+            # megfigyelt jelenség — feltehetően lassú AJAX-betöltés vagy átmeneti
+            # szerver-oldali hiba). Egy újratöltéssel általában megoldódik.
+            log.warning("[SZAMLA-ELLENORZO] Innonest /acquisition üres listát adott, újrapróbálkozás...")
+            await page.wait_for_timeout(2000)
+            await page.goto(ACQUISITION_URL, wait_until="networkidle")
+            await page.wait_for_timeout(2000)
+            sorok = await _get_beszerzesi_sorok(page)
 
         # Jelöltek: elsősorban BID-egyezés; ha nincs BID vagy nincs rá találat,
         # a lista-nézeti beszállító-név alapján is próbálkozunk (max 5 jelölt,
@@ -302,7 +327,13 @@ async def _innonest_ellenorzes_async(bid: str, cegnev: str, osszeg) -> dict:
 
     netto_szoveg = talalat.get("netto_szoveg", "")
     netto_ertek = None
-    m = re.search(r"([\d\s]+)\s*HUF", netto_szoveg)
+    # Elsődlegesen a "Nettó" felirat melletti összeget keressük (Ft vagy HUF
+    # végződéssel), mert egy megrendelő-oldalon több pénzösszeg is szerepelhet
+    # (pl. bruttó, ÁFA) — ha ez nem található, tartalékként bármilyen Ft/HUF
+    # összegre illesztünk.
+    m = re.search(r"Nett[oó][^\d]{0,20}([\d\s]{3,})\s*(?:Ft|HUF)", netto_szoveg, re.IGNORECASE)
+    if not m:
+        m = re.search(r"([\d][\d\s]{2,})\s*(?:Ft|HUF)", netto_szoveg, re.IGNORECASE)
     if m:
         try:
             netto_ertek = int(m.group(1).replace(" ", ""))
