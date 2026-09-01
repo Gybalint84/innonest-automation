@@ -20,6 +20,11 @@ FOLYAMAT:
    Mindkettő az illetékes értékesítő (deal owner) VALÓDI Cc-jével megy ki
    (2026.08.12-i javítás - lásd lentebb az EMAIL KÜLDÉS szekciónál), az
    Apps Script Web App / céges Gmail proxyn keresztül.
+8. Megjegyzést (note) ír vissza a Pipedrive deal timeline-jára arról, hogy
+   mikor (dátum + óra:perc) és milyen emailek mentek ki, kinek (To) és kinek
+   Cc-vel, valamint melyik Dropbox mappához - így az értékesítő közvetlenül
+   a dealen látja a kiküldés nyomát, nem kell Railway logot vagy Pipedrive
+   Automation Execution history-t nézegetni. (2026.09.01-i bővítés.)
 
 ELŐFELTÉTEL - Dropbox App Console beállítás (egyszeri, kézi lépés):
 1. https://www.dropbox.com/developers/apps -> Create app
@@ -69,7 +74,8 @@ VÉGPONTOK (ez a modul kettőt regisztrál)
   POST /pipedrive-webhook/dropbox-mappa  - Pipedrive webhook: mappa létrehozása,
                                            megtekintő link a deal mezőbe, File Request
                                            feltöltő link + fotózási útmutató email +
-                                           folyamat-tájékoztató email
+                                           folyamat-tájékoztató email + megjegyzés
+                                           a deal timeline-jára a kiküldött emailekről
   GET  /pipedrive-dropbox-photos         - a kalkulátor "Fotók" nézete hívja: deal_id
                                            vagy bid alapján visszaadja a mappa képeit
                                            ideiglenes, megnyitható linkekkel
@@ -245,6 +251,32 @@ def pipedrive_user_lekerese(user_id):
     return data["data"]
 
 
+def pipedrive_megjegyzes_hozzaadasa(deal_id, tartalom_html):
+    """Megjegyzést (note) hoz létre a Pipedrive deal timeline-ján.
+
+    A Pipedrive Notes API támogat egyszerű HTML formázást (<p>, <br>, <strong>,
+    <em>, <ul>/<ol>/<li>, <a href="...">, stb.) - ezt használjuk arra, hogy a
+    deal-en egyértelműen látszódjon, mikor és milyen automatikus emailek mentek
+    ki. Ez azért fontos, mert:
+      - a Railway logokhoz nem mindenki fér hozzá,
+      - a Pipedrive Automation "Execution history" csak addig őrzi a webhook
+        választ, amíg a Pipedrive engedi, és nincs deal-hez kötve,
+      - így viszont bármelyik értékesítő a deal timeline-ján rögtön látja,
+        hogy az ügyfél mikor és milyen levelet kapott tőlünk.
+    """
+    resp = requests.post(
+        f"{PIPEDRIVE_BASE}/notes",
+        params={"api_token": PIPEDRIVE_API_TOKEN},
+        json={"deal_id": deal_id, "content": tartalom_html},
+        timeout=15,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if not data.get("success"):
+        raise RuntimeError(f"Pipedrive megjegyzés hozzáadás sikertelen: {data}")
+    return data["data"]
+
+
 def ugyfel_adatok_kinyerese(deal):
     """Kinyeri a deal kapcsolattartójának nevét és email címét - PONTOSAN
     ugyanaz a metódus, mint a visszajelző email / Won automatizációnál: a
@@ -356,6 +388,42 @@ def folyamat_tajekoztato_email_osszeallitasa(kapcsolattarto_nev, owner_nev, owne
     for k, v in csere.items():
         html = html.replace(k, str(v))
     return html
+
+
+def _idopont_fmt():
+    """Aktuális dátum + időpont magyar formában, óra:perc pontossággal
+    (pl. '2026. szeptember 1. 14:32'). A Pipedrive megjegyzésben ezt
+    használjuk, hogy órára pontosan látszódjon a kiküldés ideje."""
+    d = datetime.now()
+    return f"{d.year}. {_HONAPOK[d.month - 1]} {d.day}. {d.strftime('%H:%M')}"
+
+
+def emailek_megjegyzese_osszeallitasa(email_statusz, folyamat_email_statusz,
+                                       mappanev, megtekintheto_url,
+                                       ugyfel_email, owner_email):
+    """A Pipedrive deal timeline-jára írandó megjegyzés HTML tartalmát állítja
+    össze - az emailek után hívjuk, hogy az értékesítők azonnal lássák a
+    dealen, hogy mikor és mi ment ki az ügyfélnek.
+
+    A tartalom formázása szándékosan egyszerű (Pipedrive kevés HTML tag-et
+    renderel natívan): <p>, <br>, <strong>, <ul>/<li>, <a>."""
+    idopont = _idopont_fmt()
+    cimzett_sor = (
+        f"<strong>Címzett:</strong> {ugyfel_email or '(nincs)'}<br>"
+        f"<strong>Másolat (Cc):</strong> {owner_email or '(nincs)'}"
+    )
+    return (
+        f"<p><strong>📧 Automatikus emailek kiküldve – {idopont}</strong></p>"
+        f"<ul>"
+        f"<li><strong>Fotózási útmutató:</strong> {email_statusz}</li>"
+        f"<li><strong>Folyamat-tájékoztató (Így fogunk együtt dolgozni):</strong> "
+        f"{folyamat_email_statusz}</li>"
+        f"</ul>"
+        f"<p>{cimzett_sor}</p>"
+        f"<p><strong>📁 Dropbox mappa:</strong> {mappanev}<br>"
+        f'<strong>Megtekintő link:</strong> '
+        f'<a href="{megtekintheto_url}">{megtekintheto_url}</a></p>'
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -743,10 +811,33 @@ def _deal_feldolgozasa(deal_id):
     else:
         logger.warning("Deal %s: nincs ügyfél email cím, sem a fotózási útmutató, sem a folyamat-tájékoztató email nem ment ki.", deal_id)
 
+    # ── Megjegyzés visszaírása a Pipedrive deal timeline-jára ────────────
+    # (2026.09.01., új) - hogy az értékesítők a dealen közvetlenül lássák,
+    # mikor és mi ment ki az ügyfélnek, ne kelljen Railway logot vagy
+    # Pipedrive Automation Execution history-t nézegetni. Try/except: ha
+    # ez a záró lépés valamiért hibázik, a fő cél (mappa + emailek) már
+    # megvalósult, ezért a hibát csak logoljuk, nem dobjuk fel 500-ként.
+    megjegyzes_statusz = "kihagyva"
+    try:
+        megjegyzes_html = emailek_megjegyzese_osszeallitasa(
+            email_statusz=email_statusz,
+            folyamat_email_statusz=folyamat_email_statusz,
+            mappanev=mappanev,
+            megtekintheto_url=megtekintheto_url,
+            ugyfel_email=ugyfel_email,
+            owner_email=owner_email,
+        )
+        pipedrive_megjegyzes_hozzaadasa(deal_id, megjegyzes_html)
+        megjegyzes_statusz = "hozzáadva"
+    except Exception as e:
+        logger.error("Deal %s: Pipedrive megjegyzés hozzáadás sikertelen: %s", deal_id, e)
+        megjegyzes_statusz = f"hiba: {e}"
+
     logger.info(
         "Deal %s: Dropbox mappa kész. Megtekintő link -> %s | Feltöltő link -> %s | "
-        "Fotó email: %s | Folyamat-tájékoztató email: %s",
-        deal_id, megtekintheto_url, feltoltesi_url, email_statusz, folyamat_email_statusz,
+        "Fotó email: %s | Folyamat-tájékoztató email: %s | Deal-megjegyzés: %s",
+        deal_id, megtekintheto_url, feltoltesi_url,
+        email_statusz, folyamat_email_statusz, megjegyzes_statusz,
     )
     return jsonify({
         "status": "created",
@@ -755,4 +846,5 @@ def _deal_feldolgozasa(deal_id):
         "feltoltesi_url": feltoltesi_url,
         "email": email_statusz,
         "folyamat_tajekoztato_email": folyamat_email_statusz,
+        "deal_megjegyzes": megjegyzes_statusz,
     }), 200
