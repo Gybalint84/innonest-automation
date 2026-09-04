@@ -45,6 +45,32 @@
   .error-box { margin-top: 12px; font-size: 12px; color: #b3261e; background: #fdecec; padding: 10px 12px; border-radius: 8px; display: none; line-height: 1.5; }
   .btn-retry { margin-top: 10px; width: 100%; padding: 9px; background: #fff; color: #2e2c2c; border: 1px solid #ddd; border-radius: 8px; font-size: 13px; cursor: pointer; display: none; }
   .btn-retry:hover { background: #f4f4f4; }
+
+  /* ── Sablon (A/B) választó — 2026-09: teszt jelleggel bizonyos ügyfeleknek
+     eltérő kinézetű árajánlatot küldünk. Egyelőre csak az A (jelenlegi)
+     sablon aktív, a B kiszürkítve, "hamarosan" jelzéssel — amíg meg nem
+     szerkesztjük a B sablont. Az előnézeti kép egyelőre helyőrző ikon. */
+  .tmpl-wrap { margin-bottom: 16px; }
+  .tmpl-label { font-size: 13px; color: #555; margin-bottom: 8px; }
+  .tmpl-options { display: flex; gap: 10px; }
+  .tmpl-opt {
+    flex: 1; display: flex; flex-direction: column; align-items: center; gap: 6px;
+    border: 2px solid #eee; border-radius: 10px; padding: 10px 8px 12px;
+    cursor: pointer; position: relative; text-align: center;
+  }
+  .tmpl-opt input[type=radio] { position: absolute; top: 8px; left: 8px; margin: 0; }
+  .tmpl-opt.selected { border-color: #ffde1d; background: #fffbea; }
+  .tmpl-opt.disabled { cursor: default; opacity: .5; }
+  .tmpl-preview {
+    width: 100%; aspect-ratio: 3 / 4; background: #f4f4f4; border-radius: 6px;
+    display: flex; align-items: center; justify-content: center; color: #bbb;
+  }
+  .tmpl-preview svg { width: 30px; height: 30px; }
+  .tmpl-name { font-size: 12px; font-weight: 700; color: #2e2c2c; }
+  .tmpl-badge {
+    position: absolute; top: 6px; right: 6px; font-size: 9px; font-weight: 700;
+    color: #b96a00; background: #fff3d6; border-radius: 999px; padding: 2px 7px;
+  }
 </style>
 </head>
 <body>
@@ -54,6 +80,27 @@
 
   <label for="bid">BID szám</label>
   <input type="text" id="bid" placeholder="BID-2026-185" autocomplete="off">
+
+  <div class="tmpl-wrap">
+    <div class="tmpl-label">Ajánlat sablon</div>
+    <div class="tmpl-options">
+      <label class="tmpl-opt selected" id="tmplOptA">
+        <input type="radio" name="sablon" value="a" checked>
+        <div class="tmpl-preview">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M6 2h9l5 5v15H6z"/><path d="M15 2v5h5"/><path d="M9 13h6M9 16h6M9 10h2"/></svg>
+        </div>
+        <span class="tmpl-name">A típus</span>
+      </label>
+      <label class="tmpl-opt disabled" id="tmplOptB">
+        <input type="radio" name="sablon" value="b" disabled>
+        <div class="tmpl-preview">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M6 2h9l5 5v15H6z"/><path d="M15 2v5h5"/><path d="M9 13h6M9 16h6M9 10h2"/></svg>
+        </div>
+        <span class="tmpl-name">B típus</span>
+        <span class="tmpl-badge">hamarosan</span>
+      </label>
+    </div>
+  </div>
 
   <div class="msg-wrap">
     <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px;">
@@ -91,6 +138,19 @@ const retryBtn     = document.getElementById("retryEmailBtn");
 
 let currentJobId = null;
 let userEditedMsg = false;  // true ha a felhasználó kézzel szerkesztette
+
+// ── Sablon (A/B) választó — a kijelölt kártya kiemelése kattintáskor.
+// A B egyelőre `disabled`, tehát csak az A kártyára reagál — de a kód a
+// B-t is felkészíti (ha majd feloldjuk a disabled attribútumot, működni fog).
+document.querySelectorAll(".tmpl-opt").forEach(opt => {
+  opt.addEventListener("click", () => {
+    const input = opt.querySelector("input[type=radio]");
+    if (input.disabled) return;
+    document.querySelectorAll(".tmpl-opt").forEach(o => o.classList.remove("selected"));
+    opt.classList.add("selected");
+    input.checked = true;
+  });
+});
 
 // BID bevitelkor előtölti az üzenetsablont a BID-del
 bidInput.addEventListener("input", () => {
@@ -231,10 +291,12 @@ startBtn.addEventListener("click", async () => {
   startBtn.disabled = true;
   resetUI();
   try {
+    const sablonInput = document.querySelector('input[name="sablon"]:checked');
+    const sablon = sablonInput ? sablonInput.value : "a";
     const resp = await fetch("/generate-arajanlat-pdf", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({ bid, proj_id: new URLSearchParams(location.search).get('proj_id') || '' })
+      body: JSON.stringify({ bid, sablon, proj_id: new URLSearchParams(location.search).get('proj_id') || '' })
     });
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.error || "Ismeretlen hiba");
