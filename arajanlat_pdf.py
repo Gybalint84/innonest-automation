@@ -61,6 +61,30 @@ BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 SABLON_PATH = os.path.join(BASE_DIR, "sablonok", "arajanlat_sablon.html")
 TOOL_PATH   = os.path.join(BASE_DIR, "sablonok", "pdf_tool.html")
 
+# 2026-09: A/B árajánlat-sablon választó (pdf_tool.html) — teszt jelleggel
+# bizonyos ügyfeleknek eltérő kinézetű árajánlatot küldünk. Az "A" a jelenleg
+# használt (fenti SABLON_PATH) sablon, alapértelmezett és jelenleg az EGYETLEN
+# választható opció (a "B" a pdf_tool.html felületén kiszürkítve/letiltva
+# jelenik meg, amíg meg nem szerkesztjük). A `SABLON_PATHS` és
+# `_resolve_sablon_path` így már fel van készítve a B bevezetésére: elég majd
+# létrehozni az `arajanlat_sablon_b.html` fájlt és feloldani a `disabled`
+# attribútumot a pdf_tool.html-ben — a backend-oldali logikát nem kell
+# módosítani.
+SABLON_PATHS = {
+    "a": SABLON_PATH,
+    "b": os.path.join(BASE_DIR, "sablonok", "arajanlat_sablon_b.html"),
+}
+
+
+def _resolve_sablon_path(sablon: str) -> str:
+    key = (sablon or "a").strip().lower()
+    path = SABLON_PATHS.get(key, SABLON_PATH)
+    if not os.path.exists(path):
+        if key != "a":
+            log.warning(f"[PDF] '{key}' sablon fájl még nem létezik ({path}) — 'a' sablonra esünk vissza.")
+        path = SABLON_PATH
+    return path
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # JOB ÁLLAPOT TÁROLÁS (memóriában – egyetlen Railway instance-hoz elegendő)
@@ -182,8 +206,8 @@ def tetel_sor(item: dict) -> str:
 # SABLON KITÖLTÉS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def build_arajanlat_html(adatok: dict) -> str:
-    with open(SABLON_PATH, encoding="utf-8") as f:
+def build_arajanlat_html(adatok: dict, sablon: str = "a") -> str:
+    with open(_resolve_sablon_path(sablon), encoding="utf-8") as f:
         html = f.read()
 
     items = adatok.get("tetelek", [])
@@ -784,7 +808,7 @@ def _send_pdf_email_custom(adatok: dict, pdf_path: str, custom_message: str) -> 
 # KÉTFÁZISÚ FOLYAMAT
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def _full_pipeline(bid: str, job_id: str):
+async def _full_pipeline(bid: str, job_id: str, sablon: str = "a"):
     """1. fázis: adatok kiolvasása + PDF render. Megáll a user megerősítéséig."""
     pdf_path = f"/tmp/{bid}.pdf"
 
@@ -808,7 +832,7 @@ async def _full_pipeline(bid: str, job_id: str):
         adatok = await _scrape_arajanlat(page, bid)
 
         _set_job(job_id, status="rendering", message="PDF renderelése...")
-        html = build_arajanlat_html(adatok)
+        html = build_arajanlat_html(adatok, sablon)
 
         pdf_page = await context.new_page()
         await pdf_page.set_content(html, wait_until="networkidle")
@@ -936,9 +960,9 @@ async def _run_phase2(job_id: str, custom_message: str):
     )
 
 
-async def _run_pipeline_safe(bid: str, job_id: str):
+async def _run_pipeline_safe(bid: str, job_id: str, sablon: str = "a"):
     try:
-        await _full_pipeline(bid, job_id)
+        await _full_pipeline(bid, job_id, sablon)
     except Exception as e:
         log.error(f"[PDF] Hiba ({bid}): {e}")
         log.error(traceback.format_exc())
@@ -1035,9 +1059,15 @@ def register_pdf_routes(app):
         if not re.match(r"^BID-\d{4}-\d+$", bid):
             return jsonify({"error": "Érvénytelen BID formátum (pl. BID-2026-185)"}), 400
         proj_id = (data.get("proj_id") or "").strip()
+        # 2026-09: A/B sablonválasztó (lásd SABLON_PATHS/_resolve_sablon_path
+        # fejléc-kommentje) — ismeretlen/hiányzó érték esetén "a"-ra esünk
+        # vissza, mert a pdf_tool.html jelenleg csak ezt engedi választani.
+        sablon = (data.get("sablon") or "a").strip().lower()
+        if sablon not in SABLON_PATHS:
+            sablon = "a"
         job_id = str(uuid.uuid4())
-        _set_job(job_id, status="started", message="Indítás...", bid=bid, proj_id=proj_id)
-        asyncio.run_coroutine_threadsafe(_run_pipeline_safe(bid, job_id), _loop)
+        _set_job(job_id, status="started", message="Indítás...", bid=bid, proj_id=proj_id, sablon=sablon)
+        asyncio.run_coroutine_threadsafe(_run_pipeline_safe(bid, job_id, sablon), _loop)
         return jsonify({"job_id": job_id})
 
     @app.route("/confirm-arajanlat-pdf/<job_id>", methods=["POST"])
