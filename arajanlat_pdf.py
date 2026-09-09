@@ -17,6 +17,8 @@ Végpontok:
   GET  /pdf-status/<job_id>          – lekérdezhető állapot (polling)
   GET  /pdf-download/<job_id>        – a kész PDF letöltése/megnyitása
   GET  /pdf-kikuld-status/<proj_id>  – webapp polling: email sikeresen elküldve?
+  POST /arajanlat-v2-extra           – a webapp átadja a "B" sablon extra mezőit
+                                       (szövegek + képek; ár/tétel SOSEM)
 """
 
 import os
@@ -61,18 +63,12 @@ BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 SABLON_PATH = os.path.join(BASE_DIR, "sablonok", "arajanlat_sablon.html")
 TOOL_PATH   = os.path.join(BASE_DIR, "sablonok", "pdf_tool.html")
 
-# 2026-09: A/B árajánlat-sablon választó (pdf_tool.html) — teszt jelleggel
-# bizonyos ügyfeleknek eltérő kinézetű árajánlatot küldünk. Az "A" a jelenleg
-# használt (fenti SABLON_PATH) sablon, alapértelmezett és jelenleg az EGYETLEN
-# választható opció (a "B" a pdf_tool.html felületén kiszürkítve/letiltva
-# jelenik meg, amíg meg nem szerkesztjük). A `SABLON_PATHS` és
-# `_resolve_sablon_path` így már fel van készítve a B bevezetésére: elég majd
-# létrehozni az `arajanlat_sablon_b.html` fájlt és feloldani a `disabled`
-# attribútumot a pdf_tool.html-ben — a backend-oldali logikát nem kell
-# módosítani.
+# 2026-09: A/B árajánlat-sablon választó (pdf_tool.html). Az "A" a régi
+# (fenti SABLON_PATH) sablon, a "B" a 6 oldalas prémium sablon
+# (sablonok/arajanlat_sablon_v2.html + arajanlat_v2_blokkok.py).
 SABLON_PATHS = {
     "a": SABLON_PATH,
-    "b": os.path.join(BASE_DIR, "sablonok", "arajanlat_sablon_b.html"),
+    "b": os.path.join(BASE_DIR, "sablonok", "arajanlat_sablon_v2.html"),
 }
 
 
@@ -81,9 +77,77 @@ def _resolve_sablon_path(sablon: str) -> str:
     path = SABLON_PATHS.get(key, SABLON_PATH)
     if not os.path.exists(path):
         if key != "a":
-            log.warning(f"[PDF] '{key}' sablon fájl még nem létezik ({path}) — 'a' sablonra esünk vissza.")
+            log.warning(f"[PDF] '{key}' sablon fájl nem található ({path}) — 'a' sablonra esünk vissza.")
         path = SABLON_PATH
     return path
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# A „B" SABLON SZÖVEGEI ÉS KÉPEI A WEBAPPBÓL (arajanlat-v2-extra)
+# ══════════════════════════════════════════════════════════════════════════════
+# A webapp „B ajánlat adatai" oldalán megadott szövegeket/képeket a kalkulátor
+# tölti fel ide (POST /arajanlat-v2-extra), projektazonosítóval. A PDF
+# generálásakor `proj_id` alapján vesszük elő.
+#
+# ⚠️ ALAPSZABÁLY: A TÉTELEK ÉS AZ ÁRAK KIZÁRÓLAG AZ INNONESTBŐL JÖNNEK.
+# Ez a csatorna csak SZÖVEGET és KÉPET hozhat. Két dolog garantálja:
+#   1. `build_arajanlat_html_v2` az árakat/tételeket az `adatok`-ból veszi (azt
+#      a `_scrape_arajanlat` állítja elő az Innonest oldaláról), az `extra`-ból
+#      SOHA;
+#   2. az alábbi `V2_ENGEDETT_MEZOK` engedélyezőlista — ami nincs rajta, azt
+#      eldobjuk. Így egy elrontott vagy rosszindulatú kérés sem tud árat,
+#      összeget, ÁFA-kulcsot vagy tételsort becsempészni a PDF-be.
+V2_ENGEDETT_MEZOK = {
+    # 1. oldal
+    "helyszin", "rendszer", "projekt_cim", "kapcsolat_tel", "kapcsolat_szerep",
+    "kiemelesek", "kiemeles_labjegyzet", "hero_kep",
+    # 2. oldal
+    "muszaki_bekezdes_1", "muszaki_bekezdes_2", "retegrend",
+    "retegrend_megjegyzes", "feltetelek_kivonat", "feltetelek_utalas",
+    # 3. oldal — CSAK a két szöveges mező; az összegek és a tételek NEM
+    "fizetesi_utemezes", "arak_megjegyzes",   # "afa_kulcs" NEM: az összegekből számoljuk
+    # 4. oldal
+    "lepesek", "utemezes_bekezdes", "qr_kep", "qr_felirat",
+    # 5. oldal
+    "ref_foto", "ref_chip", "ref_cim", "ref_sorok",
+    "logofal", "logofal_cim", "logofal_megjegyzes",
+    # 6. oldal
+    "melleklet_cim", "melleklet_blokkok", "melleklet_megjegyzes",
+}
+
+_v2_extra = {}                      # proj_id → { "extra": {...}, "at": epoch }
+_v2_extra_lock = threading.Lock()
+V2_EXTRA_TTL = 6 * 3600             # ennyi ideig tartjuk meg (mp)
+V2_EXTRA_MAX = 3 * 1024 * 1024      # kérésenkénti felső méretkorlát (képekkel)
+
+
+def _v2_extra_szures(extra: dict) -> dict:
+    """Csak az engedélyezett mezőket engedi át (lásd V2_ENGEDETT_MEZOK)."""
+    if not isinstance(extra, dict):
+        return {}
+    tiltott = [k for k in extra.keys() if k not in V2_ENGEDETT_MEZOK]
+    if tiltott:
+        log.warning(f"[PDF-V2] Nem engedélyezett mezők eldobva: {tiltott}")
+    return {k: v for k, v in extra.items() if k in V2_ENGEDETT_MEZOK}
+
+
+def _v2_extra_tarol(proj_id: str, extra: dict):
+    with _v2_extra_lock:
+        _v2_extra[proj_id] = {"extra": extra, "at": time.time()}
+        # lejárt bejegyzések takarítása (memóriában tartjuk, nincs adatbázis)
+        most = time.time()
+        for k in [k for k, v in _v2_extra.items() if most - v["at"] > V2_EXTRA_TTL]:
+            _v2_extra.pop(k, None)
+
+
+def _v2_extra_olvas(proj_id: str) -> dict:
+    if not proj_id:
+        return {}
+    with _v2_extra_lock:
+        be = _v2_extra.get(proj_id)
+    if not be or time.time() - be["at"] > V2_EXTRA_TTL:
+        return {}
+    return be["extra"]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -206,8 +270,24 @@ def tetel_sor(item: dict) -> str:
 # SABLON KITÖLTÉS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def build_arajanlat_html(adatok: dict, sablon: str = "a") -> str:
-    with open(_resolve_sablon_path(sablon), encoding="utf-8") as f:
+def build_arajanlat_html(adatok: dict, sablon: str = "a", extra: dict = None) -> str:
+    """A régi („A") sablon kitöltése. A „B" sablonnál átadjuk a v2 építőnek.
+
+    MINDKÉT ÁGON az `adatok` az úr: a tételek és az összegek a
+    `_scrape_arajanlat` kimenetéből származnak, azaz az Innonestből. Az
+    `extra` csak a v2 szövegeit/képeit tartalmazza (lásd V2_ENGEDETT_MEZOK).
+    """
+    if (sablon or "a").strip().lower() == "b" and os.path.exists(SABLON_PATHS["b"]):
+        try:
+            from arajanlat_v2_blokkok import build_arajanlat_html_v2
+            return build_arajanlat_html_v2(adatok, _v2_extra_szures(extra or {}))
+        except Exception as e:
+            # Ha a v2 építő hiányzik vagy hibázik, NEM bukunk el: a megszokott
+            # „A" sablonnal készül a PDF, és a log megmondja, mi történt.
+            log.error(f"[PDF-V2] A 'B' sablon nem generálható ({e}) — 'A' sablonnal folytatom.")
+            log.error(traceback.format_exc())
+
+    with open(SABLON_PATH, encoding="utf-8") as f:
         html = f.read()
 
     items = adatok.get("tetelek", [])
@@ -808,7 +888,7 @@ def _send_pdf_email_custom(adatok: dict, pdf_path: str, custom_message: str) -> 
 # KÉTFÁZISÚ FOLYAMAT
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def _full_pipeline(bid: str, job_id: str, sablon: str = "a"):
+async def _full_pipeline(bid: str, job_id: str, sablon: str = "a", extra: dict = None):
     """1. fázis: adatok kiolvasása + PDF render. Megáll a user megerősítéséig."""
     pdf_path = f"/tmp/{bid}.pdf"
 
@@ -832,7 +912,7 @@ async def _full_pipeline(bid: str, job_id: str, sablon: str = "a"):
         adatok = await _scrape_arajanlat(page, bid)
 
         _set_job(job_id, status="rendering", message="PDF renderelése...")
-        html = build_arajanlat_html(adatok, sablon)
+        html = build_arajanlat_html(adatok, sablon, extra)
 
         pdf_page = await context.new_page()
         await pdf_page.set_content(html, wait_until="networkidle")
@@ -960,9 +1040,9 @@ async def _run_phase2(job_id: str, custom_message: str):
     )
 
 
-async def _run_pipeline_safe(bid: str, job_id: str, sablon: str = "a"):
+async def _run_pipeline_safe(bid: str, job_id: str, sablon: str = "a", extra: dict = None):
     try:
-        await _full_pipeline(bid, job_id, sablon)
+        await _full_pipeline(bid, job_id, sablon, extra)
     except Exception as e:
         log.error(f"[PDF] Hiba ({bid}): {e}")
         log.error(traceback.format_exc())
@@ -1061,14 +1141,46 @@ def register_pdf_routes(app):
         proj_id = (data.get("proj_id") or "").strip()
         # 2026-09: A/B sablonválasztó (lásd SABLON_PATHS/_resolve_sablon_path
         # fejléc-kommentje) — ismeretlen/hiányzó érték esetén "a"-ra esünk
-        # vissza, mert a pdf_tool.html jelenleg csak ezt engedi választani.
+        # vissza. 2026-09 óta a "b" (6 oldalas v2 sablon) is választható.
         sablon = (data.get("sablon") or "a").strip().lower()
         if sablon not in SABLON_PATHS:
             sablon = "a"
+        # A "B" sablon extra mezői (szövegek, képek) a webappból érkeznek a
+        # /arajanlat-v2-extra végponton — ÁRAT és TÉTELT sosem tartalmaznak
+        # (lásd V2_ENGEDETT_MEZOK), azok kizárólag az Innonest-scrape-ből jönnek.
+        extra = _v2_extra_olvas(proj_id) if sablon == "b" else {}
         job_id = str(uuid.uuid4())
         _set_job(job_id, status="started", message="Indítás...", bid=bid, proj_id=proj_id, sablon=sablon)
-        asyncio.run_coroutine_threadsafe(_run_pipeline_safe(bid, job_id, sablon), _loop)
+        asyncio.run_coroutine_threadsafe(_run_pipeline_safe(bid, job_id, sablon, extra), _loop)
         return jsonify({"job_id": job_id})
+
+    @app.route("/arajanlat-v2-extra", methods=["POST"])
+    def arajanlat_v2_extra():
+        """A webapp „Árajánlat PDF" menüpontjában megadott B-sablon mezők
+        átvétele. Csak a V2_ENGEDETT_MEZOK szűrőn átmenő kulcsok tárolódnak,
+        így innen árat/tételt semmiképp nem lehet a PDF-be juttatni."""
+        if not _pdf_tool_auth_ok(request):
+            return jsonify({"error": "Unauthorized"}), 401
+        data = request.get_json(silent=True) or {}
+        proj_id = (data.get("proj_id") or "").strip()
+        if not proj_id:
+            return jsonify({"error": "Hiányzó proj_id"}), 400
+        extra = data.get("extra") or {}
+        if not isinstance(extra, dict):
+            return jsonify({"error": "Az 'extra' nem objektum"}), 400
+        try:
+            meret = len(json.dumps(extra, ensure_ascii=False).encode("utf-8"))
+        except Exception:
+            return jsonify({"error": "Az 'extra' nem szerializálható"}), 400
+        if meret > V2_EXTRA_MAX:
+            return jsonify({
+                "error": f"Túl nagy adat ({meret // 1024} KB), max {V2_EXTRA_MAX // 1024} KB. "
+                         f"Kisebb képeket tölts fel."
+            }), 413
+        szurt = _v2_extra_szures(extra)
+        _v2_extra_tarol(proj_id, szurt)
+        log.info(f"[PDF-V2] extra mentve: proj={proj_id}, {len(szurt)} mező, {meret // 1024} KB")
+        return jsonify({"ok": True, "mezok": sorted(szurt.keys())})
 
     @app.route("/confirm-arajanlat-pdf/<job_id>", methods=["POST"])
     def confirm_arajanlat_pdf(job_id):
@@ -1122,4 +1234,4 @@ def register_pdf_routes(app):
             return jsonify({"done": True, "date": date})
         return jsonify({"done": False})
 
-    log.info("[PDF] Végpontok regisztrálva: /pdf-tool, /generate-arajanlat-pdf, /confirm-arajanlat-pdf/<id>, /pdf-status/<id>, /pdf-download/<id>, /pdf-kikuld-status/<proj_id>")
+    log.info("[PDF] Végpontok regisztrálva: /pdf-tool, /generate-arajanlat-pdf, /confirm-arajanlat-pdf/<id>, /pdf-status/<id>, /pdf-download/<id>, /pdf-kikuld-status/<proj_id>, /arajanlat-v2-extra")
