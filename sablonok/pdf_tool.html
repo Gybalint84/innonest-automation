@@ -47,9 +47,10 @@
   .btn-retry:hover { background: #f4f4f4; }
 
   /* ── Sablon (A/B) választó — 2026-09: teszt jelleggel bizonyos ügyfeleknek
-     eltérő kinézetű árajánlatot küldünk. Egyelőre csak az A (jelenlegi)
-     sablon aktív, a B kiszürkítve, "hamarosan" jelzéssel — amíg meg nem
-     szerkesztjük a B sablont. Az előnézeti kép egyelőre helyőrző ikon. */
+     eltérő kinézetű árajánlatot küldünk. Az A a jelenlegi (alapértelmezett),
+     a B a 6 oldalas v2 sablon — annak szöveges/kép mezőit a webapp
+     "Árajánlat PDF" menüpontjában lehet megadni, az ÁRAK viszont a B-nél is
+     kizárólag az Innonestből jönnek. Az előnézeti kép egyelőre helyőrző ikon. */
   .tmpl-wrap { margin-bottom: 16px; }
   .tmpl-label { font-size: 13px; color: #555; margin-bottom: 8px; }
   .tmpl-options { display: flex; gap: 10px; }
@@ -71,6 +72,9 @@
     position: absolute; top: 6px; right: 6px; font-size: 9px; font-weight: 700;
     color: #b96a00; background: #fff3d6; border-radius: 999px; padding: 2px 7px;
   }
+  /* A B sablonhoz tartozó tudnivaló — csak akkor látszik, ha a B van kijelölve. */
+  .tmpl-hint { display: none; margin-top: 8px; font-size: 11px; color: #888; line-height: 1.45; }
+  .tmpl-hint.show { display: block; }
 </style>
 </head>
 <body>
@@ -91,14 +95,18 @@
         </div>
         <span class="tmpl-name">A típus</span>
       </label>
-      <label class="tmpl-opt disabled" id="tmplOptB">
-        <input type="radio" name="sablon" value="b" disabled>
+      <label class="tmpl-opt" id="tmplOptB">
+        <input type="radio" name="sablon" value="b">
         <div class="tmpl-preview">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M6 2h9l5 5v15H6z"/><path d="M15 2v5h5"/><path d="M9 13h6M9 16h6M9 10h2"/></svg>
         </div>
         <span class="tmpl-name">B típus</span>
-        <span class="tmpl-badge">hamarosan</span>
+        <span class="tmpl-badge">új</span>
       </label>
+    </div>
+    <div class="tmpl-hint" id="tmplHintB">
+      A B sablon szövegeit és képeit a webapp „Árajánlat PDF" menüpontjában
+      add meg. Az árak és a tételek a B-nél is az Innonestből jönnek.
     </div>
   </div>
 
@@ -139,9 +147,9 @@ const retryBtn     = document.getElementById("retryEmailBtn");
 let currentJobId = null;
 let userEditedMsg = false;  // true ha a felhasználó kézzel szerkesztette
 
-// ── Sablon (A/B) választó — a kijelölt kártya kiemelése kattintáskor.
-// A B egyelőre `disabled`, tehát csak az A kártyára reagál — de a kód a
-// B-t is felkészíti (ha majd feloldjuk a disabled attribútumot, működni fog).
+// ── Sablon (A/B) választó — a kijelölt kártya kiemelése kattintáskor,
+// és a B-hez tartozó tudnivaló megjelenítése.
+const tmplHintB = document.getElementById("tmplHintB");
 document.querySelectorAll(".tmpl-opt").forEach(opt => {
   opt.addEventListener("click", () => {
     const input = opt.querySelector("input[type=radio]");
@@ -149,7 +157,47 @@ document.querySelectorAll(".tmpl-opt").forEach(opt => {
     document.querySelectorAll(".tmpl-opt").forEach(o => o.classList.remove("selected"));
     opt.classList.add("selected");
     input.checked = true;
+    if (tmplHintB) tmplHintB.classList.toggle("show", input.value === "b");
   });
+});
+
+// ── A "B" sablon extra mezőinek átvétele a webappból (postMessage).
+// A webapp más origin-en fut, ezért a jelszó-cookie-t nem tudja elküldeni a
+// /arajanlat-v2-extra végpontnak — viszont ez az ablak igen. A webapp tehát
+// nekünk küldi az adatot, mi továbbítjuk a szervernek, majd nyugtázunk.
+// A szerver a V2_ENGEDETT_MEZOK whitelisttel szűr: árat/tételt innen NEM
+// lehet a PDF-be juttatni, azok az Innonestből jönnek.
+const AJV2_ALLOWED_ORIGINS = [
+  "https://sqm-hungary.hu",
+  "https://www.sqm-hungary.hu",
+  "http://localhost:5173",
+];
+let ajv2ExtraKesz = "";   // az utolsó sikeresen feltöltött proj_id
+
+window.addEventListener("message", async (e) => {
+  const d = e.data;
+  if (!d || d.type !== "sqm_ajv2_extra") return;
+  // Csak a minket megnyitó ablaktól és ismert origin-ről fogadunk el adatot.
+  if (window.opener && e.source !== window.opener) return;
+  if (!AJV2_ALLOWED_ORIGINS.includes(e.origin)) return;
+  if (ajv2ExtraKesz && ajv2ExtraKesz === d.proj_id) {
+    // már megvan — csak újranyugtázunk (a küldő ismételhet)
+    e.source.postMessage({ type: "sqm_ajv2_extra_ok", ok: true }, e.origin);
+    return;
+  }
+  try {
+    const resp = await fetch("/arajanlat-v2-extra", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ proj_id: d.proj_id, extra: d.extra || {} })
+    });
+    const res = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(res.error || ("HTTP " + resp.status));
+    ajv2ExtraKesz = d.proj_id;
+    e.source.postMessage({ type: "sqm_ajv2_extra_ok", ok: true }, e.origin);
+  } catch (err) {
+    e.source.postMessage({ type: "sqm_ajv2_extra_ok", ok: false, hiba: err.message }, e.origin);
+  }
 });
 
 // BID bevitelkor előtölti az üzenetsablont a BID-del
@@ -288,11 +336,20 @@ startBtn.addEventListener("click", async () => {
     alert("Érvénytelen BID formátum. Példa: BID-2026-185");
     return;
   }
+  const sablonInput = document.querySelector('input[name="sablon"]:checked');
+  const sablon = sablonInput ? sablonInput.value : "a";
+  // B sablonnál a webapp mezői nélkül is generálható a PDF (mindenhol az
+  // alapértelmezett szövegek jelennek meg), de erre figyelmeztetünk.
+  if (sablon === "b" && !ajv2ExtraKesz) {
+    const ok = confirm(
+      "A B sablonhoz még nem érkeztek meg a webappban megadott mezők (szövegek, képek).\n\n" +
+      "Így az alapértelmezett szövegekkel készül el a PDF. Folytatod?"
+    );
+    if (!ok) return;
+  }
   startBtn.disabled = true;
   resetUI();
   try {
-    const sablonInput = document.querySelector('input[name="sablon"]:checked');
-    const sablon = sablonInput ? sablonInput.value : "a";
     const resp = await fetch("/generate-arajanlat-pdf", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
