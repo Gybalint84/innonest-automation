@@ -19,5 +19,6 @@ COPY szamla_ellenorzo.py .
 COPY sablonok/ ./sablonok/
 COPY innonest_szamlalo.py .
 COPY billingo_teljesitmeny.py .
+COPY szamlazz_adatkapcsolat.py .
 EXPOSE 5000
 CMD ["python", "server.py"]
