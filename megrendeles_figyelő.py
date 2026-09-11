@@ -1,11 +1,20 @@
 """
 megrendeles_figyelő.py – Innonest megrendelőlap figyelő
 ========================================================
-5 percenként ellenőrzi az Innonest megrendelőlapjait.
+30 percenként ellenőrzi az Innonest megrendelőlapjait.
 Ha új "Megrendelt" státuszú tétel jelenik meg:
   - elküldi az adatokat a Google Apps Script Web App-nak
   - az Apps Script átnevezi a sheetet ("- MEGRENDELVE")
   - beírja az adatokat a QUiCK API sheetbe
+  - (ÚJ, 2026-09-11) beírja a webapp Firestore-jába is, hogy az adott
+    BID-számú ajánlatot megrendelte az ügyfél
+
+⚠️ EZ A FÁJL A "Webapp szerkesztés" React-projekt oldaláról készült PATCH —
+nem ebben a repóban él az eredeti (az az innonest-automation / Railway repo
+saját fájlja). A változásokat keresd a "# === ÚJ (2026-09-11) ===" jelölésű
+blokkokban; minden más sor változatlan az eredetihez képest. Másold be ezt a
+tartalmat a valódi megrendeles_figyelő.py helyére (vagy emeld át kézzel a
+jelölt részeket), és nézd meg a fájl alján lévő TELEPÍTÉSI LÉPÉSEK részt.
 """
 
 import os
@@ -14,6 +23,7 @@ import re
 import time
 import logging
 import threading
+from datetime import date  # === ÚJ (2026-09-11) ===
 
 import requests
 from playwright.async_api import async_playwright
@@ -32,6 +42,125 @@ WEBAPP_URL     = os.environ.get(
 )
 PROCESSED_FILE = "/tmp/feldolgozott_megrendelesek.json"
 CHECK_INTERVAL = 1800  # 30 perc
+
+# === ÚJ (2026-09-11): Firestore (SQM webapp) integráció ═══════════════════════
+# A React webapp (sqm-app-react) "Mentett projektek" listáján az 5. jelzőlámpa
+# ("Megrendelve") a `projects/{id}` dokumentum `snap.meta.megrendelve` mezőjét
+# (dátum-string, pl. "2026-09-11") mutatja — pontosan úgy, mint az
+# `ajKikuld`/`pdfKikuld` mezőket. Ezt a mezőt ez a blokk írja be, amikor egy
+# BID "Megrendelt"-té válik. A Firebase Admin SDK-s írás MEGKERÜLI a Firestore
+# security rules-t (szolgáltatásfiók = teljes jogosultság), ezért a webapp
+# oldalán NEM kell semmilyen szabály-módosítás.
+#
+# TELEPÍTÉS (lásd részletesen a fájl alján is):
+#   1. `pip install firebase-admin` (requirements.txt-be is fel kell venni)
+#   2. Firebase Console → Project settings → Service accounts →
+#      "Generate new private key" → a letöltött JSON TELJES tartalmát tedd be
+#      egyetlen Railway env var-ba: FIREBASE_SERVICE_ACCOUNT_JSON
+#   3. Amíg a fenti env var nincs beállítva, ez a blokk csendben kihagyja a
+#      Firestore-írást (figyelmeztetést logol egyszer) — a meglévő
+#      Sheet/Drive/QUiCK-folyamat változatlanul működik.
+
+_firestore_db = None
+_firestore_init_tried = False
+
+
+def _get_firestore_db():
+    """Lusta inicializálás — csak akkor importál/kapcsolódik, ha tényleg
+    kell, és csak egyszer próbálkozik (utána a memoizált eredményt adja)."""
+    global _firestore_db, _firestore_init_tried
+    if _firestore_init_tried:
+        return _firestore_db
+    _firestore_init_tried = True
+
+    cred_json = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON", "")
+    if not cred_json:
+        log.warning(
+            "FIREBASE_SERVICE_ACCOUNT_JSON nincs beállítva – a webapp "
+            "Firestore 'Megrendelve' jelzője NEM frissül (a Sheet/Drive/"
+            "QUiCK folyamat ettől függetlenül változatlanul fut)."
+        )
+        return None
+
+    try:
+        import firebase_admin
+        from firebase_admin import credentials, firestore
+        cred = credentials.Certificate(json.loads(cred_json))
+        firebase_admin.initialize_app(cred)
+        _firestore_db = firestore.client()
+        log.info("Firestore (SQM webapp) kapcsolat inicializálva.")
+    except Exception as e:
+        log.error(f"Firestore inicializálás sikertelen: {e}")
+        _firestore_db = None
+
+    return _firestore_db
+
+
+def _norm_bid(s: str) -> str:
+    """Pontos mása a webapp `domain/projects.js: normBid()` függvényének —
+    ha az ott megváltozik, ezt IS frissíteni kell, különben a két oldal
+    eltérő BID-eket fog "ugyanannak" tekinteni. Kisbetűsít, levágja a "BID"
+    előtagot (kötőjellel/szóközzel), és minden nem alfanumerikus karaktert
+    kiszűr — így "BID-2026-251", "2026-251" és "2026251" is egyenlő lesz."""
+    s = (s or "").lower()
+    s = re.sub(r"^bid[-\s]*", "", s)
+    s = re.sub(r"[^a-z0-9]", "", s)
+    return s
+
+
+def update_firestore_megrendelve(bid: str, has_bid: bool) -> None:
+    """Megkeresi a webapp `projects` gyűjteményében azt a projektet, aminek
+    `snap.meta.bid` mezője (normalizálva) egyezik a paraméterrel, és beírja
+    a mai dátumot a `snap.meta.megrendelve` mezőbe — hacsak már nincs
+    kitöltve (idempotens: nem ír felül egy korábban rögzített dátumot, és
+    nem piszkálja feleslegesen a `savedAt`-ot, ha a Railway-figyelő a
+    /tmp-beli `processed` állomány elvesztése miatt (újraindítás) újra
+    "újnak" látná ugyanazt a BID-et).
+
+    A "SORSZAM-YYYY-NNN" fallback formátumnál (amikor a sor szövegében nem
+    volt szabályos "BID-..." minta) a "SORSZAM-" előtagot levágjuk
+    egyeztetés előtt, mert a webapp oldalán soha nem ez a formátum szerepel.
+    """
+    db = _get_firestore_db()
+    if db is None:
+        return
+
+    bid_for_match = bid[len("SORSZAM-"):] if (not has_bid and bid.startswith("SORSZAM-")) else bid
+    target = _norm_bid(bid_for_match)
+    if not target:
+        log.warning(f"update_firestore_megrendelve: üres/érvénytelen BID ({bid!r}), kihagyva.")
+        return
+
+    try:
+        talalt = 0
+        for doc in db.collection("projects").stream():
+            data = doc.to_dict() or {}
+            if data.get("deleted"):
+                continue
+            meta = ((data.get("snap") or {}).get("meta")) or {}
+            if _norm_bid(meta.get("bid", "")) != target:
+                continue
+
+            talalt += 1
+            if (meta.get("megrendelve") or "").strip():
+                log.info(f"Firestore: {bid} projektje már meg van jelölve megrendelve-ként ({doc.id}), nem írom felül.")
+                continue
+
+            doc.reference.update({
+                "snap.meta.megrendelve": date.today().isoformat(),
+                "savedAt": __import__("datetime").datetime.utcnow().isoformat() + "Z",
+            })
+            log.info(f"✅ Firestore: {bid} → 'Megrendelve' beírva a(z) {doc.id} projekthez.")
+
+        if talalt == 0:
+            log.warning(f"Firestore: nem található projekt ehhez a BID-hez: {bid} (a webapp meta.bid mezője alapján).")
+        elif talalt > 1:
+            log.warning(f"Firestore: {talalt} projekt is egyezett a(z) {bid} BID-re — mindegyiket megjelöltem, érdemes ellenőrizni az adatot.")
+
+    except Exception as e:
+        log.error(f"Firestore írás hiba ({bid}): {e}")
+
+# ═══════════════════════════════════════════════════════════════════════════
 
 
 # ── Feldolgozott BID-ek tárolása ──────────────────────────────────────────────
@@ -216,6 +345,12 @@ async def check_megrendelesek():
 
                 if result.get("success"):
                     log.info(f"✅ {bid} sikeresen feldolgozva")
+                    # === ÚJ (2026-09-11): webapp Firestore "Megrendelve" jelző ===
+                    try:
+                        update_firestore_megrendelve(bid, tetel.get("has_bid", False))
+                    except Exception as e:
+                        log.error(f"Firestore-frissítés hiba ({bid}): {e}")
+                    # ══════════════════════════════════════════════════════════
                     processed.add(row_id)
                     save_processed(processed)
                 else:
@@ -230,7 +365,7 @@ async def check_megrendelesek():
 # ── Háttérszál indítása ───────────────────────────────────────────────────────
 
 def megrendeles_figyelő():
-    """Háttérszál: 5 percenként ellenőrzi az Innonest megrendelőlapokat."""
+    """Háttérszál: 30 percenként ellenőrzi az Innonest megrendelőlapokat."""
     log.info("Megrendelés figyelő elindult.")
     while True:
         try:
@@ -244,3 +379,37 @@ def megrendeles_figyelő():
 def start_figyelő():
     """Elindítja a figyelőt egy daemon szálban. Hívd meg a server.py-ból."""
     threading.Thread(target=megrendeles_figyelő, daemon=True).start()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TELEPÍTÉSI LÉPÉSEK (2026-09-11, webapp "Megrendelve" jelzőlámpa)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# 1) requirements.txt (a Railway repóban) — vedd fel, ha még nincs:
+#      firebase-admin
+#
+# 2) Firebase szolgáltatásfiók:
+#    - Firebase Console → ⚙️ Project settings → Service accounts fül
+#    - "Generate new private key" gomb → letölt egy .json fájlt
+#    - A JSON TELJES tartalmát (egy sorban, escapelve nem kell) másold be
+#      Railway-en egy új env var-ba: FIREBASE_SERVICE_ACCOUNT_JSON
+#      (Railway → a szolgáltatás → Variables → New Variable)
+#
+# 3) Semmi mást nem kell módosítani a Firestore security rules-on — a
+#    szolgáltatásfiókos (Admin SDK) írás megkerüli a rules-t.
+#
+# 4) Ellenőrzés bevezetés után: a Railway logban keresd a
+#    "Firestore (SQM webapp) kapcsolat inicializálva." és a
+#    "✅ Firestore: BID-... → 'Megrendelve' beírva..." sorokat.
+#    Ha a "FIREBASE_SERVICE_ACCOUNT_JSON nincs beállítva" warning jön újra és
+#    újra, az env var nem érte el a futó szolgáltatást (Railway redeploy
+#    kellhet a változó felvétele után).
+#
+# 5) Ismert korlát (nem ebben a patch-ben javított, de érdemes tudni róla):
+#    a PROCESSED_FILE a /tmp alatt van, ami Railway-újraindításkor kiürül —
+#    ilyenkor minden aktuálisan "Megrendelt" tétel újra "újnak" fog látszani,
+#    és újra lefut rájuk a teljes lánc (Sheet/Drive/QUiCK ÉS Firestore is).
+#    A Firestore-oldalt ez nem veszélyezteti (a fenti idempotencia-ellenőrzés
+#    miatt nem ír felül egy már kitöltött `megrendelve` dátumot), de a
+#    Sheet/Drive/QUiCK oldalon ez már korábban is megvolt — ez a patch nem
+#    változtat ezen a viselkedésen.
