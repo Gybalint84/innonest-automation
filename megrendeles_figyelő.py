@@ -26,10 +26,10 @@ minta, amit a `/ertekesito-teljesitmeny` végpont is használ.
 nem ebben a repóban él az eredeti (az az innonest-automation / Railway repo
 saját fájlja). A változásokat keresd a "# === ÚJ (2026-09-11) ===" jelölésű
 blokkokban; minden más sor változatlan az eredetihez képest. Másold be ezt a
-tartalmat a valódi megrendeles_figyelő.py helyére, és nézd meg a fájl alján
-lévő TELEPÍTÉSI LÉPÉSEK részt — abban van egy pont, amit NEKED kell
-véglegesítened (a Flask `app` objektum importja, mert az nálam nem látható,
-csak a server.py-ban).
+tartalmat a valódi megrendeles_figyelő.py helyére, ÉS a server.py-ban add
+hozzá a 2 sort, ami a fájl alján, a TELEPÍTÉSI LÉPÉSEK résznél van leírva
+(a server.py-t már láttam, ott pontosan tudom, hova kell — ugyanaz a
+`register_X_routes(app)` minta, mint a többi modulnál).
 """
 
 import os
@@ -41,6 +41,7 @@ import threading
 from datetime import date  # === ÚJ (2026-09-11) ===
 
 import requests
+from flask import request, jsonify  # === ÚJ (2026-09-11) — a /megrendelt-bidek végponthoz
 from playwright.async_api import async_playwright
 
 from innonest_core import (
@@ -78,11 +79,13 @@ CHECK_INTERVAL = 1800  # 30 perc
 
 MEGRENDELT_BIDEK_FILE = "/tmp/megrendelt_bidek.json"
 
-# Ugyanaz a kulcs, amit a webapp (services/megrendelesFigyelo.js) is használ
-# a Railway API-hívásokhoz — pl. "X-API-Key" headerben várjuk. Ha nálatok ez
-# másik env var/érték a szerveren, itt (és a webapp oldalon is) frissíteni
-# kell, hogy egyezzenek.
-API_KEY = os.environ.get("API_KEY", "389188")
+# Ugyanaz az API_KEY env var, amit a server.py is definiál (ott
+# `API_KEY = os.environ.get("API_KEY", "titkos-kulcs")` — a fallback string
+# csak lokális/dev futtatáshoz kell, éles Railway-en az env var van
+# beállítva, és az egyezik a webapp services/megrendelesFigyelo.js-ében
+# beégetett "389188" értékkel). Itt külön is beolvassuk (nem importáljuk a
+# server.py-ból), hogy ez a modul önmagában is importálható maradjon.
+API_KEY = os.environ.get("API_KEY", "titkos-kulcs")
 
 
 def load_megrendelt_bidek() -> dict:
@@ -123,21 +126,18 @@ def frissits_megrendelt_bidek(tetelek: list):
     return bidek
 
 
-def megrendelt_bidek_endpoint():
-    """Flask view-függvény — regisztráld a szerveren, pl.:
-        from megrendeles_figyelő import megrendelt_bidek_endpoint
-        app.add_url_rule("/megrendelt-bidek", "megrendelt_bidek",
-                          megrendelt_bidek_endpoint, methods=["GET"])
-    (VAGY, ha nálatok Blueprint/dekorátor mintát használtok a többi
-    endpointnál — pl. a /ertekesito-teljesitmeny-nél —, akkor UGYANAZT a
-    mintát kövesd itt is; ezt a fájlt nem tudtam ahhoz igazítani, mert a
-    server.py nincs nálam.)
-    Válasz: {"ok": true, "items": {"<bid>": "<ISO dátum>", ...}}
+def register_megrendelt_bidek_routes(app):
+    """Ugyanaz a regisztrációs minta, mint a többi modulnál (server.py):
+        from megrendeles_figyelő import register_megrendelt_bidek_routes
+        register_megrendelt_bidek_routes(app)
+    Végpont: GET /megrendelt-bidek, X-API-Key header kötelező.
+    Válasz: {"ok": true, "items": {"<bid, ahogy az Innonestben szerepel>": "<ISO dátum>", ...}}
     """
-    from flask import request, jsonify  # helyi import, hogy a modul Flask nélkül is importálható maradjon
-    if request.headers.get("X-API-Key") != API_KEY:
-        return jsonify({"ok": False, "error": "Érvénytelen API-kulcs"}), 401
-    return jsonify({"ok": True, "items": load_megrendelt_bidek()})
+    @app.route("/megrendelt-bidek", methods=["GET"])
+    def megrendelt_bidek_route():
+        if request.headers.get("X-API-Key") != API_KEY:
+            return jsonify({"ok": False, "error": "Unauthorized"}), 401
+        return jsonify({"ok": True, "items": load_megrendelt_bidek()})
 
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -369,39 +369,29 @@ def start_figyelő():
 #
 # Ehhez a verzióhoz NEM kell Firebase-kulcs, NEM kell requirements.txt
 # módosítás, és NEM kell Firestore security rules módosítás — csak egy új
-# HTTP végpontot kell regisztrálni a meglévő Flask szerveren.
+# HTTP végpontot kell regisztrálni a meglévő Flask szerveren, PONTOSAN
+# ugyanazzal a mintával, mint a többi modul (server.py-t láttam, ez már a
+# véglegesített, konkrét lépés):
 #
-# 1) Nyisd meg a server.py-t (vagy ahol a Flask `app` létrejön és a többi
-#    endpoint regisztrálva van — pl. ahol a `/ertekesito-teljesitmeny` van).
+# 1) Cseréld le a valódi megrendeles_figyelő.py tartalmát erre a fájlra.
 #
-# 2) Adj hozzá egy sort, ami regisztrálja az új végpontot. Kétféle minta
-#    lehet nálatok, nézd meg melyikhez hasonlít a meglévő kód:
+# 2) A server.py-ban keresd meg ezt a részt:
+#      # 1. Megrendelés figyelő háttérszál indítása
+#      from megrendeles_figyelő import start_figyelő
+#      start_figyelő()
+#    És KÖZVETLENÜL utána szúrd be ezt a 2 sort:
+#      # 1b. "Megrendelve" JSON-végpont regisztrálása (webapp badge)
+#      from megrendeles_figyelő import register_megrendelt_bidek_routes
+#      register_megrendelt_bidek_routes(app)
 #
-#    a) Ha egyszerű "app.add_url_rule" vagy "@app.route" mintát használtok:
-#         from megrendeles_figyelő import megrendelt_bidek_endpoint
-#         app.add_url_rule("/megrendelt-bidek", "megrendelt_bidek",
-#                           megrendelt_bidek_endpoint, methods=["GET"])
+#    (Semmi mást nem kell módosítani a server.py-ban — az `app` objektum már
+#    létezik ezen a ponton, és az `API_KEY` env var is már be van állítva
+#    Railway-en, azt csak újraolvassuk a megrendeles_figyelő.py-ban is.)
 #
-#    b) Ha a modulban magában van a dekorátor (mint gyanítom a
-#       billingo_teljesitmeny.py-ban lehet a /ertekesito-teljesitmeny-nél),
-#       akkor ide, a fájl tetején (ahol az "app" importálható) tedd:
-#         from server import app
-#         @app.route("/megrendelt-bidek", methods=["GET"])
-#         def megrendelt_bidek_route():
-#             return megrendelt_bidek_endpoint()
-#
-#    Ha egyik sem világos, küldd át a server.py-t (vagy a
-#    billingo_teljesitmeny.py-t) is, és pontosítom ezt a lépést.
-#
-# 3) Ellenőrizd, hogy az API_KEY env var (vagy a fenti fallback "389188")
-#    ugyanaz, mint amit a webapp (src/services/megrendelesFigyelo.js)
-#    használ — ha nálatok az API-kulcs env var neve más, írd át a fenti
-#    `API_KEY = os.environ.get("API_KEY", "389188")` sort.
-#
-# 4) Push a GitHub repóba → Railway automatikusan újraépíti és -indítja a
+# 3) Push a GitHub repóba → Railway automatikusan újraépíti és -indítja a
 #    szolgáltatást.
 #
-# 5) Ellenőrzés: nyisd meg böngészőben (vagy Postmannel, X-API-Key headerrel)
+# 4) Ellenőrzés: nyisd meg böngészőben (vagy Postmannel, X-API-Key headerrel)
 #    a https://sqm-visszajelzes.up.railway.app/megrendelt-bidek címet — ha
 #    van jelenleg Megrendelt BID az Innonestben, egy ilyesmit kell kapnod:
 #    {"ok": true, "items": {"BID-2026-251": "2026-09-11"}}
