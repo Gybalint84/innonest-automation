@@ -236,8 +236,13 @@ def valasz_xml(irany, szamlazz_id=None, iktatoszam=None, hibakod=None):
 
 # ---------------------------------------------------------------- Sheet írás (Apps Script proxy)
 
-def sheet_upsert(rekord, tetelek, timeout=25):
-    """Elküldi a rekordot az Apps Script web app-nak. Sikertelenség esetén kivételt dob."""
+def sheet_upsert(rekord, tetelek, timeout=15):
+    """Elküldi a rekordot az Apps Script web app-nak. Sikertelenség esetén kivételt dob.
+
+    Rövid timeout szándékos: a Számlázz.hu a tartósan lassú fogadórendszert letilthatja.
+    Inkább gyors 500 → ők 72 órán át újraküldik. A Sheet-írás idempotens (upsert a
+    szamlazz_id-re), így a duplikált újraküldés nem okoz gondot.
+    """
     url = os.environ.get("SZAMLAZZ_WEBAPP_URL")
     secret = os.environ.get("SZAMLAZZ_WEBAPP_SECRET")
     if not url or not secret:
