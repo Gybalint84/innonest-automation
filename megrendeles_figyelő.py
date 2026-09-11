@@ -1,7 +1,9 @@
 """
 megrendeles_figyelő.py – Innonest megrendelőlap figyelő
 ========================================================
-30 percenként ellenőrzi az Innonest megrendelőlapjait.
+ÓRÁNKÉNT (2026-09-11-ig 30 percenként volt), és CSAK hétköznap 7:00–18:00
+között (magyar idő) ellenőrzi az Innonest megrendelőlapjait — hétvégén és
+éjszaka nincs értelme futtatni, ott úgysem történik új Innonest-megrendelés.
 Ha új "Megrendelt" státuszú tétel jelenik meg:
   - elküldi az adatokat a Google Apps Script Web App-nak
   - az Apps Script átnevezi a sheetet ("- MEGRENDELVE")
@@ -38,7 +40,8 @@ import re
 import time
 import logging
 import threading
-from datetime import date  # === ÚJ (2026-09-11) ===
+from datetime import date, datetime  # === MÓDOSÍTVA (2026-09-11): datetime is kell az üzemidő-ellenőrzéshez
+from zoneinfo import ZoneInfo  # === ÚJ (2026-09-11) === — magyar idő, nyári/téli időszámítással együtt
 
 import requests
 from flask import request, jsonify  # === ÚJ (2026-09-11) — a /megrendelt-bidek végponthoz
@@ -57,7 +60,26 @@ WEBAPP_URL     = os.environ.get(
     "https://script.google.com/macros/s/AKfycbyy1PQmHyBSlnWpXQR9bygVfFV_g2gJI9_7UjDI5zHm2xXElIX1DvsszM_UJu8l7too/exec"
 )
 PROCESSED_FILE = "/tmp/feldolgozott_megrendelesek.json"
-CHECK_INTERVAL = 1800  # 30 perc
+
+# === MÓDOSÍTVA (2026-09-11): 30 percről 1 órára, ÉS csak üzemidőben fut ===
+# (lásd UZEMIDO_KEZDET/UZEMIDO_VEG + uzemido_van() lentebb). A Railway a
+# konténert feltehetően UTC-ben futtatja, ezért a "7:00–18:00" magyar
+# (Europe/Budapest) időt a ZoneInfo-val számoljuk ki — ez a nyári/téli
+# időszámítás-váltást is automatikusan kezeli, nem kell kézzel UTC+1/+2-t
+# számolgatni.
+CHECK_INTERVAL = 3600  # 1 óra
+UZEMIDO_KEZDET = 7   # óra, magyar idő szerint (inkluzív)
+UZEMIDO_VEG    = 18  # óra, magyar idő szerint (exkluzív — 18:00-tól már nem fut)
+BUDAPEST_TZ = ZoneInfo("Europe/Budapest")
+
+
+def uzemido_van(most=None) -> bool:
+    """Csak hétköznap (hétfő=0 … péntek=4) és UZEMIDO_KEZDET–UZEMIDO_VEG
+    (magyar idő) között ad True-t. Hétvégén és a megadott sávon kívül a
+    figyelő NEM fut le — ilyenkor a háttérszál csak alszik és a következő
+    óránkénti ébredéskor ellenőriz újra."""
+    now = most or datetime.now(BUDAPEST_TZ)
+    return now.weekday() < 5 and UZEMIDO_KEZDET <= now.hour < UZEMIDO_VEG
 
 # === ÚJ (2026-09-11): webapp "Megrendelve" jelző — adattárolás + végpont ══════
 # A React webapp (sqm-app-react) "Mentett projektek" listáján az 5. jelzőlámpa
@@ -347,13 +369,18 @@ async def check_megrendelesek():
 # ── Háttérszál indítása ───────────────────────────────────────────────────────
 
 def megrendeles_figyelő():
-    """Háttérszál: 30 percenként ellenőrzi az Innonest megrendelőlapokat."""
+    """Háttérszál: óránként ellenőrzi az Innonest megrendelőlapokat, DE csak
+    hétköznap 7:00–18:00 között (magyar idő) — lásd uzemido_van() fentebb.
+    Üzemidőn kívül a szál csak alszik és a legközelebbi ébredéskor néz újra."""
     log.info("Megrendelés figyelő elindult.")
     while True:
-        try:
-            run_in_loop(check_megrendelesek())
-        except Exception as e:
-            log.error(f"Figyelő hiba: {e}")
+        if uzemido_van():
+            try:
+                run_in_loop(check_megrendelesek())
+            except Exception as e:
+                log.error(f"Figyelő hiba: {e}")
+        else:
+            log.info("Üzemidőn kívül (csak hétköznap 7–18 óra közt fut) – kihagyva.")
         log.info(f"Következő ellenőrzés {CHECK_INTERVAL // 60} perc múlva...")
         time.sleep(CHECK_INTERVAL)
 
@@ -395,13 +422,14 @@ def start_figyelő():
 #    a https://sqm-visszajelzes.up.railway.app/megrendelt-bidek címet — ha
 #    van jelenleg Megrendelt BID az Innonestben, egy ilyesmit kell kapnod:
 #    {"ok": true, "items": {"BID-2026-251": "2026-09-11"}}
-#    Ha üres az "items", vagy még nem futott le a figyelő egy kört (max. 30
-#    percet várhat), vagy tényleg nincs jelenleg Megrendelt tétel.
+#    Ha üres az "items", vagy még nem futott le a figyelő egy kört (üzemidőn
+#    KÍVÜL — hétvégén, vagy 18:00–7:00 közt — egyáltalán nem fut, üzemidőben
+#    is max. 1 órát várhat), vagy tényleg nincs jelenleg Megrendelt tétel.
 #
-# 6) Ismert korlát (nem ebben a patch-ben javított, de érdemes tudni róla):
+# 5) Ismert korlát (nem ebben a patch-ben javított, de érdemes tudni róla):
 #    mind a PROCESSED_FILE, mind az ÚJ MEGRENDELT_BIDEK_FILE a /tmp alatt
 #    van, ami Railway-újraindításkor kiürül. A MEGRENDELT_BIDEK_FILE ettől
-#    nem szenved tartós adatvesztést, mert minden 30 perces körben újra
-#    felépül minden AKTUÁLISAN "Megrendelt" tételből — legfeljebb egy környi
-#    (max. 30 perc) késést okozhat, mire a webapp badge-e frissül egy
+#    nem szenved tartós adatvesztést, mert minden órás körben újra felépül
+#    minden AKTUÁLISAN "Megrendelt" tételből — legfeljebb egy környi (max. 1
+#    óra, üzemidőn belül) késést okozhat, mire a webapp badge-e frissül egy
 #    újraindítás után.
