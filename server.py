@@ -57,6 +57,9 @@ def check_now():
 # 1. Megrendelés figyelő háttérszál indítása
 from megrendeles_figyelő import start_figyelő
 start_figyelő()
+# 1b. "Megrendelve" JSON-végpont regisztrálása (webapp badge)
+from megrendeles_figyelő import register_megrendelt_bidek_routes
+register_megrendelt_bidek_routes(app)
 # 2. Árajánlat feltöltő végpont regisztrálása
 from arajanlat_feltolto import register_arajanlat_routes
 register_arajanlat_routes(app)
