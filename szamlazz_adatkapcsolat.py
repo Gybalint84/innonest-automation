@@ -6,9 +6,16 @@ Bekötés a server.py-ba (a többi modulhoz hasonlóan):
     register_szamlazz_routes(app)
 
 Railway env változók:
-    SZAMLAZZ_KEY            – a Számlázz.hu fiókban beállított azonosító kulcs (max 40 kar., utolsó 5 = rendszer-postfix)
-    SZAMLAZZ_WEBAPP_URL     – az "SQM Számla Adatkapcsolat" Apps Script web app URL-je (/exec)
-    SZAMLAZZ_WEBAPP_SECRET  – közös titok a web app-pal
+    SZAMLAZZ_KEY                    – a Számlázz.hu fiókban beállított azonosító kulcs (utolsó 5 = rendszer-postfix)
+    SZAMLAZZ_SHEET_ID               – a cél munkafüzet ID-je
+    SZAMLAZZ_GOOGLE_CLIENT_ID       – OAuth kliens (Desktop app)
+    SZAMLAZZ_GOOGLE_CLIENT_SECRET
+    SZAMLAZZ_GOOGLE_REFRESH_TOKEN   – az oauth_token_szerzo.py adja
+
+A Sheet írása KÖZVETLENÜL a Google Sheets API-n megy, nem Apps Script proxyn keresztül.
+Ok: az Apps Script fiókszinten korlátozott és lassú (több másodperc/hívás), ami a
+Számlázz.hu párhuzamos küldésénél időtúllépést okozott, és a többi SQM automatizmus
+elől is elszívta a végrehajtási kapacitást.
 
 Endpointok (ezeket kell megadni a Számlázz.hu regisztrációnál):
     POST /szamlazz/kimeno   – kimenő számlák (szamla.xsd)
@@ -16,7 +23,7 @@ Endpointok (ezeket kell megadni a Számlázz.hu regisztrációnál):
     GET  /szamlazz/health   – életjel
 
 Működés:
-    Számlázz.hu → POST application/xml (+ X-Szamlazzhu-Key fejléc) → parse → Apps Script upsert a Sheetbe
+    Számlázz.hu → POST application/xml (+ X-Szamlazzhu-Key fejléc) → parse → Sheets API upsert
     → válasz HTTP 200 + <szamlavalasz>/<szamlabevalasz> XML az <alap><id>-vel.
     Ha a Sheet-írás nem sikerül → HTTP 500 (nincs érvényes válasz) → a Számlázz.hu 72 órán át újrapróbálja.
     Ugyanaz a számla többször is jön (fizetettség / adatváltozás) → a Sheetben az <alap><id> alapján UPDATE.
@@ -24,11 +31,13 @@ Működés:
 
 import logging
 import os
+import threading
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 
-import requests
 from flask import request, Response
+
+import sheets_kliens as sk
 
 log = logging.getLogger("szamlazz")
 
@@ -234,29 +243,115 @@ def valasz_xml(irany, szamlazz_id=None, iktatoszam=None, hibakod=None):
     return "".join(reszek)
 
 
-# ---------------------------------------------------------------- Sheet írás (Apps Script proxy)
+# ---------------------------------------------------------------- Sheet írás (közvetlen Sheets API)
 
-def sheet_upsert(rekord, tetelek, timeout=15):
-    """Elküldi a rekordot az Apps Script web app-nak. Sikertelenség esetén kivételt dob.
+SZAMLA_LAP, TETEL_LAP, NAPLO_LAP = "Számlák", "Tételek", "Napló"
 
-    Rövid timeout szándékos: a Számlázz.hu a tartósan lassú fogadórendszert letilthatja.
-    Inkább gyors 500 → ők 72 órán át újraküldik. A Sheet-írás idempotens (upsert a
-    szamlazz_id-re), így a duplikált újraküldés nem okoz gondot.
-    """
-    url = os.environ.get("SZAMLAZZ_WEBAPP_URL")
-    secret = os.environ.get("SZAMLAZZ_WEBAPP_SECRET")
-    if not url or not secret:
-        raise RuntimeError("SZAMLAZZ_WEBAPP_URL / SZAMLAZZ_WEBAPP_SECRET nincs beállítva")
-    payload = {"action": "szamla_upsert", "secret": secret, "rekord": rekord, "tetelek": tetelek}
-    r = requests.post(url, json=payload, timeout=timeout, allow_redirects=True)  # Apps Script 302-t ad → követjük
-    r.raise_for_status()
-    try:
-        adat = r.json()
-    except ValueError:
-        raise RuntimeError(f"webapp nem JSON-nal válaszolt: {r.text[:200]}")
-    if not adat.get("ok"):
-        raise RuntimeError(f"webapp hiba: {adat.get('error')}")
-    return adat
+TETEL_OSZLOPOK = ["irany", "szamlazz_id", "szamlaszam", "sorszam", "megnevezes", "mennyiseg", "egyseg",
+                  "egysegar", "afatipus", "afakulcs", "netto", "afa", "brutto", "netto_huf",
+                  "devizanem", "megjegyzes"]
+
+_ir_lock = threading.Lock()          # a sorindexek miatt egyszerre egy írás fusson
+_index = {"kesz": False, "szamla": {}, "tetel": {}, "lap_id": {}}
+
+
+def _kulcs(irany, szamlazz_id):
+    return f"{irany}|{szamlazz_id}"
+
+
+def _index_epites():
+    """Egyszeri beolvasás induláskor: melyik számla melyik sorban van."""
+    meglevo = sk.lapok()
+    for nev, fejlec in ((SZAMLA_LAP, OSZLOPOK), (TETEL_LAP, TETEL_OSZLOPOK), (NAPLO_LAP, ["idopont", "tipus", "uzenet"])):
+        if nev not in meglevo:
+            sk.lap_letrehozas(nev, fejlec)
+            meglevo = sk.lapok()
+    _index["lap_id"] = meglevo
+
+    _index["szamla"] = {}
+    for i, sor in enumerate(sk.olvas(f"'{SZAMLA_LAP}'!A2:B"), start=2):
+        if len(sor) >= 2 and sor[1]:
+            _index["szamla"][_kulcs(sor[0], sor[1])] = i
+
+    _index["tetel"] = {}
+    for i, sor in enumerate(sk.olvas(f"'{TETEL_LAP}'!A2:B"), start=2):
+        if len(sor) >= 2 and sor[1]:
+            _index["tetel"].setdefault(_kulcs(sor[0], sor[1]), []).append(i)
+
+    _index["kesz"] = True
+    log.info("Sheet index felépítve: %d számla, %d tételcsoport",
+             len(_index["szamla"]), len(_index["tetel"]))
+
+
+def _blokkok(sorok):
+    """[3,4,5,9,10] → [(3,3),(9,2)] — összefüggő szakaszok, hogy egy hívással törölhessünk."""
+    ki = []
+    for sz in sorted(sorok):
+        if ki and sz == ki[-1][0] + ki[-1][1]:
+            ki[-1] = (ki[-1][0], ki[-1][1] + 1)
+        else:
+            ki.append((sz, 1))
+    return ki
+
+
+def _eltolas(index_szotar, hatar, mennyivel):
+    """Sortörlés után a nála nagyobb sorszámok elcsúsznak."""
+    for k, v in index_szotar.items():
+        if isinstance(v, list):
+            index_szotar[k] = [x - mennyivel if x > hatar else x for x in v]
+        elif v > hatar:
+            index_szotar[k] = v - mennyivel
+
+
+def sheet_upsert(rekord, tetelek):
+    """Egy számla (és tételei) beírása vagy frissítése. Hiba esetén kivételt dob."""
+    with _ir_lock:
+        if not _index["kesz"]:
+            _index_epites()
+
+        kulcs = _kulcs(rekord["irany"], rekord["szamlazz_id"])
+        ertekek = [[rekord.get(k, "") if rekord.get(k) is not None else "" for k in OSZLOPOK]]
+
+        sor = _index["szamla"].get(kulcs)
+        if sor:
+            sk.ir(f"'{SZAMLA_LAP}'!A{sor}", ertekek)
+            muvelet = "update"
+        else:
+            valasz = sk.hozzafuz(f"'{SZAMLA_LAP}'!A1", ertekek)
+            sor = sk.sorszam_updated_range(valasz)
+            _index["szamla"][kulcs] = sor
+            muvelet = "insert"
+
+        _tetelek_irasa(kulcs, rekord, tetelek)
+
+        sk.hozzafuz(f"'{NAPLO_LAP}'!A1", [[
+            datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), muvelet,
+            f"{rekord['irany']} {rekord['szamlaszam']} {rekord['partner_nev']} "
+            f"{rekord['brutto']} {rekord['devizanem']} → {rekord['statusz']}"]])
+
+        return {"ok": True, "muvelet": muvelet, "sor": sor, "tetelek": len(tetelek)}
+
+
+def _tetelek_irasa(kulcs, rekord, tetelek):
+    regi = _index["tetel"].get(kulcs, [])
+    ujak = [[t.get(k, "") if t.get(k) is not None else "" for k in TETEL_OSZLOPOK] for t in tetelek]
+
+    # Gyakori eset: ismételt küldésnél ugyanannyi tétel jön → helyben felülírjuk, nincs törlés.
+    if regi and len(regi) == len(ujak) and _blokkok(regi) == [(min(regi), len(regi))]:
+        sk.ir(f"'{TETEL_LAP}'!A{min(regi)}", ujak)
+        return
+
+    if regi:
+        blokkok = _blokkok(regi)
+        sk.sorok_torlese(_index["lap_id"][TETEL_LAP], blokkok)
+        for kezd, db in sorted(blokkok, reverse=True):
+            _eltolas(_index["tetel"], kezd + db - 1, db)
+        _index["tetel"].pop(kulcs, None)
+
+    if ujak:
+        valasz = sk.hozzafuz(f"'{TETEL_LAP}'!A1", ujak)
+        elso = sk.sorszam_updated_range(valasz)
+        _index["tetel"][kulcs] = list(range(elso, elso + len(ujak)))
 
 
 # ---------------------------------------------------------------- Flask route-ok
@@ -299,5 +394,11 @@ def register_szamlazz_routes(app):
 
     @app.route("/szamlazz/health", methods=["GET"])
     def szamlazz_health():
-        return {"ok": True, "key_set": bool(os.environ.get("SZAMLAZZ_KEY")),
-                "webapp_set": bool(os.environ.get("SZAMLAZZ_WEBAPP_URL"))}
+        return {"ok": True,
+                "key_set": bool(os.environ.get("SZAMLAZZ_KEY")),
+                "sheet_set": bool(os.environ.get("SZAMLAZZ_SHEET_ID")),
+                "oauth_set": all(os.environ.get(v) for v in (
+                    "SZAMLAZZ_GOOGLE_CLIENT_ID", "SZAMLAZZ_GOOGLE_CLIENT_SECRET",
+                    "SZAMLAZZ_GOOGLE_REFRESH_TOKEN")),
+                "index_kesz": _index["kesz"],
+                "szamlak_a_sheeten": len(_index["szamla"])}
