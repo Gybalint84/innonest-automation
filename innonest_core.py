@@ -390,6 +390,13 @@ async def upload_csatolmany(page, csatolmany: dict, bid_szam: str):
 # ÁRAJÁNLAT TÉTELEK KINYERÉSE (pipedrive_addon hívja)
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _szam_parse(s) -> float:
+    """Innonest-számszöveg → float. Kezeli: "1 936 062,00", "1 936 062,00",
+    "1936062.00", "1886". Ezres elválasztó: (nem törő) szóköz; tizedes: , vagy ."""
+    t = re.sub(r"[\s  ]", "", str(s))
+    return float(t.replace(",", "."))
+
+
 async def get_arajanlat_tetelek(page, bid: str) -> dict:
     eredmeny = {
         "tetelek": [], "netto_osszeg": "",
@@ -439,14 +446,28 @@ async def get_arajanlat_tetelek(page, bid: str) -> dict:
         await page.goto(szerkeszto_url, wait_until="networkidle")
         await page.wait_for_timeout(3000)
 
-        tetelek = await page.evaluate("""
+        tetelek_js = await page.evaluate("""
             () => {
                 const tetelek = [];
                 let sorszam = 1;
+                let hidden_count = 0;
                 const sorok = document.querySelectorAll(
                     'tbody.items-box tr.items:not([data-id="0"])'
                 );
                 sorok.forEach(tr => {
+                    // 2026-09: az "ügyfél elől elrejt" (áthúzott szem) gombbal
+                    // elrejtett sorok (STO/Eurostep/Murexin beszerzési-áras
+                    // anyagsorok, lásd arajanlat_feltolto.py:
+                    // _toggle_hide_from_customer) a hideElementsRow class-t
+                    // kapják — ezek a Kivitelezési tájékoztató emailbe és a
+                    // visszajelző oldalra sem kerülhetnek (ugyanaz a szabály,
+                    // mint az arajanlat_pdf.py-ban). A sorszám csak a látható
+                    // sorokra lép, így az ügyfél 1..N folytonos számozást lát.
+                    if (tr.classList.contains('hideElementsRow')) {
+                        hidden_count++;
+                        return;
+                    }
+
                     const nevInput = tr.querySelector('input[name^="productsName"]');
                     const nev = nevInput ? nevInput.value.trim() : '';
                     if (!nev || nev.length < 2) return;
@@ -495,9 +516,14 @@ async def get_arajanlat_tetelek(page, bid: str) -> dict:
                         osszesen: osszesen
                     });
                 });
-                return tetelek;
+                return { items: tetelek, hidden_count };
             }
         """)
+
+        tetelek = tetelek_js.get("items", []) if isinstance(tetelek_js, dict) else []
+        hidden_count = tetelek_js.get("hidden_count", 0) if isinstance(tetelek_js, dict) else 0
+        if hidden_count:
+            log.info(f"[TETELEK] {hidden_count} elrejtett (hideElementsRow) sor kihagyva ({bid})")
 
         if tetelek:
             for t in tetelek:
@@ -508,7 +534,7 @@ async def get_arajanlat_tetelek(page, bid: str) -> dict:
                 ear = str(t.get("egysegar", "")).strip()
                 if ear:
                     try:
-                        ear_szam = float(ear.replace(" ", "").replace(",", "."))
+                        ear_szam = _szam_parse(ear)
                         t["egysegar"] = f"{ear_szam:,.0f}".replace(",", " ") + " Ft"
                     except Exception:
                         t["egysegar"] = ear + " Ft"
@@ -516,7 +542,7 @@ async def get_arajanlat_tetelek(page, bid: str) -> dict:
                 ossz = str(t.get("osszesen", "")).strip()
                 if ossz:
                     try:
-                        ossz_szam = float(ossz.replace(" ", "").replace(",", "."))
+                        ossz_szam = _szam_parse(ossz)
                         t["osszesen"] = f"{ossz_szam:,.0f}".replace(",", " ") + " Ft"
                     except Exception:
                         t["osszesen"] = ossz + " Ft"
@@ -544,7 +570,10 @@ async def get_arajanlat_tetelek(page, bid: str) -> dict:
 
         if netto_js:
             try:
-                eredmeny["netto_osszeg"] = f"{int(float(netto_js.replace(',', '.'))):,}".replace(",", " ")
+                # Az Innonest ezres tagolással adja ("1 936 062,00") — a szóközök
+                # miatt a float() korábban elhasalt, és a nyers "…,00" alak került
+                # az emailbe. _szam_parse kiszedi a (nem törő) szóközöket is.
+                eredmeny["netto_osszeg"] = f"{int(round(_szam_parse(netto_js))):,}".replace(",", " ")
             except Exception:
                 eredmeny["netto_osszeg"] = netto_js
 
