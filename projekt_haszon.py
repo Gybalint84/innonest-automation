@@ -113,14 +113,46 @@ def anyag_szallito_e(partner_nev, lista=None):
 
 # ---------------------------------------------------------------- 1. kimenő → BID (Innonest /invoices)
 
-def _acquisition_page_url(offset):
-    """Beszerzési lista lapozási URL-je.
+LISTA_OLDALMERET = 100          # az innonest_szamlalo-val azonos lapméret
+ACQ_ALAP = "https://app.innonest.hu/acquisition"
 
-    Az Innonest listák két mintát használnak: a /invoices "/index/{offset}/",
-    a /ordersheets viszont "/index/{offset}/all". Az élő próbán (2026-09-18) a
-    perjeles változat MINDIG az első oldalt adta vissza, ezért itt az /all-os
-    mintát használjuk, a /ordersheets-hez hasonlóan."""
-    return f"https://app.innonest.hu/acquisition/index/{offset}/all"
+# A beszerzési lista lapozása (Bálint megerősítette, 2026-09-18):
+#   1. oldal: /acquisition/index/0/      2. oldal: /acquisition/index/100/
+ACQ_OLDAL = ACQ_ALAP + "/index/{o}/"
+
+
+async def _acq_betolt(page, url, timeout=20000):
+    """Oldalbetöltés, ami nem dönti el a futást. True, ha sikerült."""
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+        await page.wait_for_timeout(800)
+        return True
+    except Exception as e:  # noqa: BLE001
+        log.warning("[HASZON] Beszerzési oldal nem tölthető (%s): %s", url, str(e)[:120])
+        return False
+
+
+async def _acq_lista(page, get_sorok, max_oldal=30):
+    """A beszerzési lista összes sora, oldalanként 100-asával.
+    Ha egy oldal nem tölthető be, a addig összegyűjtött sorokkal tér vissza,
+    figyelmeztetéssel — a frissítés ettől nem áll meg."""
+    lista, latott = [], set()
+    for oldal in range(max_oldal):
+        url = ACQ_OLDAL.format(o=oldal * LISTA_OLDALMERET)
+        if not await _acq_betolt(page, url):
+            gond = f"a beszerzési lista {oldal + 1}. oldala nem tölthető be ({url})"
+            if oldal == 0:
+                return [], gond
+            return lista, gond + f" — csak {len(lista)} sort látunk, az anyagköltség hiányos lehet"
+        sorok = await get_sorok(page)
+        ujak = [x for x in sorok if x.get("azonosito") and x["azonosito"] not in latott]
+        latott.update(x["azonosito"] for x in ujak)
+        lista.extend(ujak)
+        if len(sorok) < LISTA_OLDALMERET or not ujak:
+            break
+    else:
+        return lista, f"a beszerzési lista {max_oldal} oldalnál sem ért véget — lehet, hogy van még"
+    return lista, ""
 
 
 def kimeno_bid_kinyeres(innonest_szamla_sorok):
@@ -518,7 +550,7 @@ async def _innonest_gyujtes_async(kezdo_bidek):
     (modált csak azokhoz a BID-ekhez nyitunk, amelyek a kimenő számlákon vagy a kézi listán szerepelnek)."""
     from playwright.async_api import async_playwright
     from innonest_core import login, load_session, make_browser_args
-    from innonest_szamlalo import _scrape_rows, _invoices_page_url, LISTA_OLDALMERET, DATE_PATTERN
+    from innonest_szamlalo import _scrape_rows, _invoices_page_url, DATE_PATTERN
     from szamla_ellenorzo import _get_beszerzesi_sorok, _nyisd_meg_reszletek
 
     ev = datetime.now().year
@@ -550,26 +582,11 @@ async def _innonest_gyujtes_async(kezdo_bidek):
 
         erdekes_bidek = set(kezdo_bidek) | set(kimeno_bid_kinyeres(szamla_sorok).values())
 
-        # -- beszerzési megrendelőlapok, VÉGIGLAPOZVA
-        # A _get_beszerzesi_sorok csak az aktuális oldalt olvassa; korábban ezért
-        # csak az első 100 sort láttuk, és a régebbi projektek megrendelőlapjai
-        # (pl. BID-2026-259) kimaradtak.
-        lista, latott = [], set()
-        for oldal in range(30):
-            await page.goto(_acquisition_page_url(oldal * LISTA_OLDALMERET), wait_until="networkidle")
-            await page.wait_for_timeout(800)
-            oldal_sorok = await _get_beszerzesi_sorok(page)
-            ujak = [x for x in oldal_sorok if x.get("azonosito") and x["azonosito"] not in latott]
-            if not ujak:
-                if oldal == 1 and len(oldal_sorok) >= LISTA_OLDALMERET:
-                    log.warning("[HASZON] A beszerzési lista 2. oldala ugyanazt adta vissza — "
-                                "a lapozási URL-minta rossz, csak az első %d sort látjuk!", len(lista))
-                break
-            latott.update(x["azonosito"] for x in ujak)
-            lista.extend(ujak)
-            if len(oldal_sorok) < LISTA_OLDALMERET:
-                break
-        log.info("[HASZON] Beszerzési megrendelőlapok: %d sor %d oldalról", len(lista), oldal + 1)
+        # -- beszerzési megrendelőlapok
+        lista, lapozas_gond = await _acq_lista(page, _get_beszerzesi_sorok)
+        if lapozas_gond:
+            log.warning("[HASZON] %s", lapozas_gond)
+        log.info("[HASZON] Beszerzési megrendelőlapok: %d sor", len(lista))
 
         beszerzesek = []
         for s in lista:
@@ -589,8 +606,9 @@ async def _innonest_gyujtes_async(kezdo_bidek):
             })
         await browser.close()
 
-    log.info("[HASZON] Innonest: %d számlasor, %d beszerzés az érdekes BID-ekhez", len(szamla_sorok), len(beszerzesek))
-    return szamla_sorok, beszerzesek
+    log.info("[HASZON] Innonest: %d számlasor, %d beszerzés az érdekes BID-ekhez",
+             len(szamla_sorok), len(beszerzesek))
+    return szamla_sorok, beszerzesek, lapozas_gond
 
 
 # ---------------------------------------------------------------- Sheet I/O
@@ -707,7 +725,7 @@ def frissites():
         b = bid_normalizal(r.get("megjegyzes", "") + " " + r.get("rendelesszam", ""))
         if b:
             kezdo_bidek.add(b)
-    szamla_sorok, beszerzesek = run_in_loop(_innonest_gyujtes_async(kezdo_bidek))
+    szamla_sorok, beszerzesek, lapozas_gond = run_in_loop(_innonest_gyujtes_async(kezdo_bidek))
     kimeno_bid = kimeno_bid_kinyeres(szamla_sorok)
     kiv_index = {b["kiv"]: b["bid"] for b in beszerzesek if b.get("kiv") and b.get("bid")}
 
@@ -723,6 +741,7 @@ def frissites():
         "nincs_kalkulacio": sum(1 for p in projektek if p["allapot"] == "nincs kalkuláció"),
         "anyagszallitok": AKTIV_ANYAG_LISTA,
         "nevmegfeleltetes": AKTIV_NEVMEGFELELTETES,
+        "figyelmeztetes": lapozas_gond or "",
     }
 
 
@@ -734,7 +753,7 @@ async def _diag_innonest_async(bid):
     """Nyersen visszaadja, mit lát az Innonest az adott BID-hez."""
     from playwright.async_api import async_playwright
     from innonest_core import login, load_session, make_browser_args
-    from innonest_szamlalo import _scrape_rows, _invoices_page_url, LISTA_OLDALMERET
+    from innonest_szamlalo import _scrape_rows, _invoices_page_url
     from szamla_ellenorzo import _get_beszerzesi_sorok, _nyisd_meg_reszletek
 
     ki = {"kimeno_szamlasorok": [], "beszerzesek": []}
@@ -759,44 +778,8 @@ async def _diag_innonest_async(bid):
                 break
             offset += LISTA_OLDALMERET
 
-        # Melyik lapozási URL-minta működik? Mindkettőt kipróbáljuk a 2. oldalon.
-        ki["lapozas_proba"] = {}
-        mintak = {"/index/{o}/all": "https://app.innonest.hu/acquisition/index/{o}/all",
-                  "/index/{o}/": "https://app.innonest.hu/acquisition/index/{o}/",
-                  "?page=N": "https://app.innonest.hu/acquisition?page={p}"}
-        elso_azonositok = None
-        mukodo = None
-        for nev, sablon in mintak.items():
-            try:
-                await page.goto(sablon.format(o=0, p=1), wait_until="networkidle")
-                await page.wait_for_timeout(700)
-                a = {x["azonosito"] for x in await _get_beszerzesi_sorok(page)}
-                await page.goto(sablon.format(o=LISTA_OLDALMERET, p=2), wait_until="networkidle")
-                await page.wait_for_timeout(700)
-                b = {x["azonosito"] for x in await _get_beszerzesi_sorok(page)}
-                ki["lapozas_proba"][nev] = {"1_oldal_sor": len(a), "2_oldal_sor": len(b),
-                                            "atfedes": len(a & b), "uj_a_2_oldalon": len(b - a)}
-                if b - a and not mukodo:
-                    mukodo = sablon
-                elso_azonositok = elso_azonositok or a
-            except Exception as e:  # noqa: BLE001
-                ki["lapozas_proba"][nev] = {"hiba": str(e)[:150]}
-        ki["mukodo_lapozas"] = mukodo or "EGYIK SEM — a lista nem lapozható ezekkel az URL-ekkel"
-
-        lista, latott = [], set()
-        sablon = mukodo or mintak["/index/{o}/all"]
-        for oldal in range(30):
-            await page.goto(sablon.format(o=oldal * LISTA_OLDALMERET, p=oldal + 1), wait_until="networkidle")
-            await page.wait_for_timeout(800)
-            oldal_sorok = await _get_beszerzesi_sorok(page)
-            ujak = [x for x in oldal_sorok if x.get("azonosito") and x["azonosito"] not in latott]
-            if not ujak:
-                break
-            latott.update(x["azonosito"] for x in ujak)
-            lista.extend(ujak)
-            if len(oldal_sorok) < LISTA_OLDALMERET:
-                break
-        ki["acquisition_oldalak"] = oldal + 1
+        lista, lapozas_gond = await _acq_lista(page, _get_beszerzesi_sorok)
+        ki["lapozas_gond"] = lapozas_gond or ""
         ki["acquisition_osszes_sor"] = len(lista)
         ki["acquisition_bid_lista"] = sorted({x["bid"] for x in lista if x.get("bid")})[:200]
         ki["acquisition_bid_talalatok"] = sum(1 for s in lista if s.get("bid"))
