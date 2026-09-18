@@ -73,8 +73,8 @@ def _hivas(metodus, ut, **kw):
 _utolso_401 = False
 
 
-def _id():
-    sid = os.environ.get("SZAMLAZZ_SHEET_ID")
+def _id(sheet_id=None):
+    sid = sheet_id or os.environ.get("SZAMLAZZ_SHEET_ID")
     if not sid:
         raise RuntimeError("SZAMLAZZ_SHEET_ID nincs beállítva")
     return sid
@@ -82,47 +82,47 @@ def _id():
 
 # ---------------------------------------------------------------- műveletek
 
-def lapok():
+def lapok(sheet_id=None):
     """{lapnév: sheetId} — a munkafüzet lapjai."""
-    adat = _hivas("GET", f"{API}/{_id()}", params={"fields": "sheets.properties(sheetId,title)"})
+    adat = _hivas("GET", f"{API}/{_id(sheet_id)}", params={"fields": "sheets.properties(sheetId,title)"})
     return {s["properties"]["title"]: s["properties"]["sheetId"] for s in adat.get("sheets", [])}
 
 
-def lap_letrehozas(nev, fejlec):
-    _hivas("POST", f"{API}/{_id()}:batchUpdate",
+def lap_letrehozas(nev, fejlec, sheet_id=None):
+    _hivas("POST", f"{API}/{_id(sheet_id)}:batchUpdate",
            json={"requests": [{"addSheet": {"properties": {"title": nev, "gridProperties": {"frozenRowCount": 1}}}}]})
-    ir(f"'{nev}'!A1", [fejlec])
+    ir(f"'{nev}'!A1", [fejlec], sheet_id=sheet_id)
     log.info("Sheet lap létrehozva: %s", nev)
 
 
-def olvas(tartomany):
-    adat = _hivas("GET", f"{API}/{_id()}/values/{requests.utils.quote(tartomany, safe='')}",
+def olvas(tartomany, sheet_id=None):
+    adat = _hivas("GET", f"{API}/{_id(sheet_id)}/values/{requests.utils.quote(tartomany, safe='')}",
                   params={"majorDimension": "ROWS"})
     return adat.get("values", [])
 
 
-def ir(tartomany, sorok):
-    return _hivas("PUT", f"{API}/{_id()}/values/{requests.utils.quote(tartomany, safe='')}",
+def ir(tartomany, sorok, sheet_id=None):
+    return _hivas("PUT", f"{API}/{_id(sheet_id)}/values/{requests.utils.quote(tartomany, safe='')}",
                   params={"valueInputOption": "RAW"}, json={"values": sorok})
 
 
-def hozzafuz(tartomany, sorok):
+def hozzafuz(tartomany, sorok, sheet_id=None):
     """Hozzáfűzés; visszaadja, hova került (updatedRange), hogy tudjuk a sorszámot."""
-    return _hivas("POST", f"{API}/{_id()}/values/{requests.utils.quote(tartomany, safe='')}:append",
+    return _hivas("POST", f"{API}/{_id(sheet_id)}/values/{requests.utils.quote(tartomany, safe='')}:append",
                   params={"valueInputOption": "RAW", "insertDataOption": "INSERT_ROWS",
                           "includeValuesInResponse": "false"},
                   json={"values": sorok})
 
 
-def sorok_torlese(sheet_id, blokkok):
+def sorok_torlese(lap_sheet_id, blokkok, sheet_id=None):
     """blokkok: [(kezdo_sor_1alapu, darab)] — egy batchUpdate hívásban, alulról felfelé."""
     if not blokkok:
         return
     kerelmek = [{"deleteDimension": {"range": {
-        "sheetId": sheet_id, "dimension": "ROWS",
+        "sheetId": lap_sheet_id, "dimension": "ROWS",
         "startIndex": kezd - 1, "endIndex": kezd - 1 + db}}}
         for kezd, db in sorted(blokkok, reverse=True)]
-    _hivas("POST", f"{API}/{_id()}:batchUpdate", json={"requests": kerelmek})
+    _hivas("POST", f"{API}/{_id(sheet_id)}:batchUpdate", json={"requests": kerelmek})
 
 
 def sorszam_updated_range(valasz):
@@ -131,3 +131,8 @@ def sorszam_updated_range(valasz):
     resz = tart.split("!")[-1]
     szam = "".join(c for c in resz.split(":")[0] if c.isdigit())
     return int(szam) if szam else 0
+
+
+def torol(tartomany, sheet_id=None):
+    """Cellatartomány kiürítése (a kimutatás-lapok újraírásához)."""
+    return _hivas("POST", f"{API}/{_id(sheet_id)}/values/{requests.utils.quote(tartomany, safe='')}:clear", json={})
