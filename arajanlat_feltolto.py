@@ -776,6 +776,13 @@ async def run_automation(payload: dict):
 
         log.info(f"{len(items)} tétel feltöltése...")
 
+        # 2026-09-18: minden hideFromCustomer (STO/Eurostep/Murexin) sor
+        # (row, item) párját itt gyűjtjük, hogy a Mentés előtt egy ZÁRÓ
+        # körben még egyszer visszaírhassuk az értékeket — lásd a lenti
+        # nagy kommentet, miért kell ez a `_reapply_row_values` soron
+        # belüli visszaigazolása MELLÉ.
+        hide_rows = []
+
         # 1. tétel: az 1-es indexű template sorba (sor 0-t kihagyjuk)
         await fill_tetel(
             page, 1,
@@ -793,6 +800,7 @@ async def run_automation(payload: dict):
                     unmatched_materials.append(items[0]["megnevezes"])
                 await _reapply_row_values(page, row0, items[0])
                 await _toggle_hide_from_customer(page, items[0]["megnevezes"], row=row0)
+                hide_rows.append((row0, items[0]))
             else:
                 log.warning(f"[ANYAG-VALASZTAS] Sor nem található (1. tétel): '{items[0]['megnevezes']}'")
                 unmatched_materials.append(items[0]["megnevezes"])
@@ -823,9 +831,34 @@ async def run_automation(payload: dict):
                         unmatched_materials.append(item["megnevezes"])
                     await _reapply_row_values(page, row_n, item)
                     await _toggle_hide_from_customer(page, item["megnevezes"], row=row_n)
+                    hide_rows.append((row_n, item))
                 else:
                     log.warning(f"[ANYAG-VALASZTAS] Sor nem található: '{item['megnevezes']}'")
                     unmatched_materials.append(item["megnevezes"])
+
+        # ⚠️ 2026-09-18, hibajavítás: élesben előfordult, hogy egy STO anyag
+        # (pl. "StoQuarz beszóróanyag, 0,3-0,8 mm, 25 kg") mennyisége az
+        # Innonestben 1-re, ára 0-ra állt vissza, ANNAK ELLENÉRE, hogy a
+        # `_reapply_row_values` a saját során belül sikeresen visszaigazolta
+        # a helyes értéket (100 kg). A webapp saját Rendelési összesítője
+        # (Rendeles.jsx) ugyanabból az `orderSummary()` függvényből
+        # ugyanerre az anyagra helyesen 100 kg-ot mutatott — tehát a hiba
+        # NEM a webapp számításában, hanem itt, az Innonest-feltöltésben
+        # keletkezett. Valószínű ok: a `_reapply_row_values` csak az ADOTT
+        # sor feldolgozása UTÁN, de a KÖVETKEZŐ sor feldolgozása (autocomplete-
+        # kiválasztás / "Új tétel hozzáadása") ELŐTT ellenőriz — ha az
+        # Innonest egy KÉSŐBBI sor kiválasztásakor egy ÁLTALÁNOS (pl.
+        # összesítő) újraszámítást indít, az egy KORÁBBAN már jónak
+        # visszaigazolt sort is felülírhat, és ezt a soron belüli
+        # visszaigazolás nem veszi észre. Ezért itt, a Mentés gomb
+        # megnyomása ELŐTT, egy ZÁRÓ körben MÉG EGYSZER visszaírjuk/
+        # visszaigazoljuk az ÖSSZES elrejtett (hideFromCustomer) sort — ez
+        # már semmilyen későbbi sor-művelet által nem írható felül, tehát ez
+        # az igazi végleges állapot mentés előtt.
+        if hide_rows:
+            log.info(f"[ANYAG-VALASZTAS] Záró ellenőrzés a Mentés előtt ({len(hide_rows)} elrejtett sor)...")
+            for row, item in hide_rows:
+                await _reapply_row_values(page, row, item)
 
         await page.wait_for_timeout(300)
 
