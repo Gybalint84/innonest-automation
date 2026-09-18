@@ -88,6 +88,8 @@ from szamla_ellenorzo import register_szamla_routes
 register_szamla_routes(app)
 from szamlazz_adatkapcsolat import register_szamlazz_routes
 register_szamlazz_routes(app)
+from projekt_haszon import register_projekt_haszon_routes
+register_projekt_haszon_routes(app)
 # ── Indítás ───────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
