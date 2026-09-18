@@ -380,14 +380,16 @@ def kalkulalt_lekeres(bid):
                 "from": [{"collectionId": "projects"}],
                 "where": {"fieldFilter": {"field": {"fieldPath": "snap.meta.bid"},
                                           "op": "EQUAL", "value": {"stringValue": bid}}},
-                "orderBy": [{"field": {"fieldPath": "savedAt"}, "direction": "DESCENDING"}],
-                "limit": 5}})
+                "limit": 20}})
         if r.status_code >= 400:
-            log.warning("[HASZON] Firestore kalkuláció-lekérdezés %s: %s", r.status_code, r.text[:200])
+            log.warning("[HASZON] Firestore kalkuláció-lekérdezés (%s) %s: %s",
+                        bid, r.status_code, r.text[:300])
             return None
         dokok = [_fs_dok(x["document"]) for x in r.json() if x.get("document")]
         if not dokok:
             return None
+        # rendezés itt, nem a lekérdezésben (lásd fent: összetett index kellene hozzá)
+        dokok.sort(key=lambda x: str(x.get("savedAt") or x.get("createdAt") or ""), reverse=True)
         d = dokok[0]                      # a legutóbb mentett verzió
         snap = d.get("snap") or {}
         meta = snap.get("meta") or {}
@@ -1060,6 +1062,32 @@ def _diag_szamlak(bid):
                           "csökkenő nettó szerint — ezek a jelöltek a kézi hozzárendeléshez."}
 
 
+def _diag_kalkulacio(bid):
+    """Mit ad a snap.meta.bid szerinti lekérdezés — nyersen, hibaüzenettel együtt."""
+    ki = {"bid": bid}
+    try:
+        fejlec = {"Authorization": "Bearer " + sk.access_token()}
+        r = requests.post(_firestore_ut() + ":runQuery", headers=fejlec, timeout=30, json={
+            "structuredQuery": {
+                "from": [{"collectionId": "projects"}],
+                "where": {"fieldFilter": {"field": {"fieldPath": "snap.meta.bid"},
+                                          "op": "EQUAL", "value": {"stringValue": bid}}},
+                "limit": 20}})
+        ki["http_statusz"] = r.status_code
+        if r.status_code >= 400:
+            ki["valasz"] = r.text[:600]
+            return ki
+        dokok = [_fs_dok(x["document"]) for x in r.json() if x.get("document")]
+        ki["talalt_projektek"] = [{"name": d.get("name"), "savedAt": d.get("savedAt"),
+                                   "van_totals": bool((d.get("snap") or {}).get("totals")),
+                                   "totals_kulcsok": sorted(((d.get("snap") or {}).get("totals") or {}).keys())}
+                                  for d in dokok]
+        ki["feldolgozott"] = kalkulalt_lekeres(bid)
+    except Exception as e:  # noqa: BLE001
+        ki["hiba"] = f"{type(e).__name__}: {e}"
+    return ki
+
+
 def diagnosztika(bid, projekt_id=None):
     from innonest_core import run_in_loop
     ki = {"bid": bid, "sheet": {}, "innonest": {}, "firestore": {}}
@@ -1075,6 +1103,7 @@ def diagnosztika(bid, projekt_id=None):
     except Exception as e:  # noqa: BLE001
         ki["innonest"] = {"hiba": f"{type(e).__name__}: {e}"}
     ki["firestore"] = _diag_firestore(bid)
+    ki["kalkulacio"] = _diag_kalkulacio(bid)
     return ki
 
 
