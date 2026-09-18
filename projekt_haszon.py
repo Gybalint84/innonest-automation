@@ -214,12 +214,89 @@ def naplo_index_epites(naplo_sorok):
 
 # ---------------------------------------------------------------- 4. kalkulált (webapp) — BEKÖTENDŐ
 
+# A webapp Firestore-szerkezete (élőben feltérképezve, 2026-09-18):
+#   projects/{id}: id, name, createdAt, savedAt, tasks, snap
+#   snap.meta.bid      → "BID-2026-258"   (ez a kapocs a számlákhoz)
+#   snap.meta.ceg      → ügyfél neve
+#   snap.meta.nev      → projekt megnevezése
+#   snap.ALV.lastAppliedDij → {"Roliék": 13807000, "Saját csapat": 7006748}  — alvállalkozói díjak
+#   snap.ALV.dijKi     → a kiválasztott kivitelező neve ("Chemibau Kft")
+#   snap.totals.*      → az összesített kalkulált értékek (a webappnak MENTENIE KELL, lásd lent)
+#
+# FONTOS: a snap a kalkulátor BEMENETEIT tárolja (mennyiségek, rétegrendek, egységárak),
+# nem a kiszámolt végösszegeket. A kalkulált ANYAGKÖLTSÉG ezért nem olvasható ki közvetlenül —
+# ahhoz a webappnak mentéskor ki kell írnia egy összesítőt (snap.totals). Amíg ez nincs meg,
+# az alvállalkozói díj rendelkezésre áll, az anyagköltség nem.
+
+SAJAT_CSAPAT_KULCS = "Saját csapat"
+
+
+def _kalk_alvallalkozoi(alv):
+    """Az ALKALMAZOTT alvállalkozói díj és hogy saját csapattal számoltunk-e.
+    Visszaad: (díj vagy None, sajat_csapat bool, megjegyzés)."""
+    dijak = (alv or {}).get("lastAppliedDij") or {}
+    dijak = {k: v for k, v in dijak.items() if isinstance(v, (int, float)) and not isinstance(v, bool)}
+    if not dijak:
+        return None, False, "nincs alvállalkozói díj a kalkulációban"
+    valasztott = (alv or {}).get("dijKi") or ""
+    # 1) a kiválasztott kivitelező neve szerepel a díjak között
+    for k in dijak:
+        if valasztott and k.strip().lower() == valasztott.strip().lower():
+            return dijak[k], k == SAJAT_CSAPAT_KULCS, ""
+    # 2) csak egy díj van → az az alkalmazott
+    if len(dijak) == 1:
+        k = next(iter(dijak))
+        return dijak[k], k == SAJAT_CSAPAT_KULCS, ""
+    # 3) több díj, és a kiválasztott nincs köztük → nem tippelünk
+    return None, SAJAT_CSAPAT_KULCS in dijak, \
+        f"több alvállalkozói díj ({', '.join(dijak)}), a kiválasztott '{valasztott}' nincs köztük"
+
+
 def kalkulalt_lekeres(bid):
-    """
-    A Padló kalkulátor webappból: {'bevetel': ..., 'anyag': ..., 'munkadij': ..., 'sajat_csapat': bool, 'ugyfel': str}
-    vagy None, ha nincs kalkuláció. Ide jön a Firestore/webapp-olvasás, ha ismert a tárolás szerkezete.
-    """
-    return None
+    """A kalkuláció a webapp Firestore-jából, snap.meta.bid alapján.
+    None, ha nincs ilyen projekt vagy nincs Firestore-hozzáférés."""
+    if not bid or not os.environ.get("SZAMLAZZ_FIREBASE_PROJECT_ID"):
+        return None
+    try:
+        fejlec = {"Authorization": "Bearer " + sk.access_token()}
+        r = requests.post(_firestore_ut() + ":runQuery", headers=fejlec, timeout=30, json={
+            "structuredQuery": {
+                "from": [{"collectionId": "projects"}],
+                "where": {"fieldFilter": {"field": {"fieldPath": "snap.meta.bid"},
+                                          "op": "EQUAL", "value": {"stringValue": bid}}},
+                "orderBy": [{"field": {"fieldPath": "savedAt"}, "direction": "DESCENDING"}],
+                "limit": 5}})
+        if r.status_code >= 400:
+            log.warning("[HASZON] Firestore kalkuláció-lekérdezés %s: %s", r.status_code, r.text[:200])
+            return None
+        dokok = [_fs_dok(x["document"]) for x in r.json() if x.get("document")]
+        if not dokok:
+            return None
+        d = dokok[0]                      # a legutóbb mentett verzió
+        snap = d.get("snap") or {}
+        meta = snap.get("meta") or {}
+        totals = snap.get("totals") or {}
+
+        alv_dij, sajat, alv_megj = _kalk_alvallalkozoi(snap.get("ALV"))
+        anyag = totals.get("anyagKalk", totals.get("anyag"))
+        munkadij = totals.get("alvKalk", totals.get("munkadij", alv_dij))
+        bevetel = totals.get("ajanlatNetto", totals.get("bevetel"))
+        if isinstance(totals.get("sajatCsapat"), bool):
+            sajat = totals["sajatCsapat"]
+
+        hianyzo = []
+        if anyag is None:
+            hianyzo.append("kalkulált anyagköltség (a webapp nem mentette)")
+        if munkadij is None:
+            hianyzo.append(alv_megj or "kalkulált alvállalkozói díj")
+
+        return {"bevetel": bevetel, "anyag": anyag, "munkadij": munkadij,
+                "sajat_csapat": sajat, "ugyfel": meta.get("ceg") or "",
+                "projekt_nev": meta.get("nev") or d.get("name") or "",
+                "tobb_verzio": len(dokok) > 1, "hianyzo": hianyzo}
+    except Exception as e:  # noqa: BLE001
+        log.warning("[HASZON] kalkulált érték nem olvasható (%s): %s", bid, e)
+        return None
 
 
 # ---------------------------------------------------------------- 5. összeállítás (tiszta függvény — tesztelhető)
@@ -308,18 +385,27 @@ def kimutatas_osszeallitas(szamlak, tetelek, kimeno_bid, beszerzesek, naplo_inde
         elif kalk is None:
             sor["allapot"] = "nincs kalkuláció"
         else:
-            kh = _num(kalk.get("bevetel")) - _num(kalk.get("anyag")) - _num(kalk.get("munkadij"))
-            sor.update({
-                "kalk_bevetel": round(_num(kalk.get("bevetel"))), "kalk_anyag": round(_num(kalk.get("anyag"))),
-                "kalk_munkadij": round(_num(kalk.get("munkadij"))), "kalk_haszon": round(kh),
-                "elteres_ft": round(haszon - kh),
-                "elteres_pct": round((haszon - kh) / kh * 100, 1) if kh else "",
-                "sajat_csapat": "saját csapat is volt kint" if kalk.get("sajat_csapat") else "",
-                "allapot": "kiértékelt",
-            })
             sor["ugyfel"] = sor["ugyfel"] or kalk.get("ugyfel", "")
+            sor["sajat_csapat"] = "saját csapat is volt kint" if kalk.get("sajat_csapat") else ""
+            for cel, forras_kulcs in (("kalk_bevetel", "bevetel"), ("kalk_anyag", "anyag"),
+                                      ("kalk_munkadij", "munkadij")):
+                if kalk.get(forras_kulcs) is not None:
+                    sor[cel] = round(_num(kalk[forras_kulcs]))
+            if kalk.get("hianyzo"):
+                # Részleges kalkuláció: a haszon-összehasonlítás félrevezető lenne.
+                sor["allapot"] = "részleges kalkuláció"
+                sor["megjegyzes"] = "hiányzik: " + "; ".join(kalk["hianyzo"])
+            else:
+                kh = _num(kalk["bevetel"]) - _num(kalk["anyag"]) - _num(kalk["munkadij"])
+                sor.update({"kalk_haszon": round(kh), "elteres_ft": round(haszon - kh),
+                            "elteres_pct": round((haszon - kh) / kh * 100, 1) if kh else "",
+                            "allapot": "kiértékelt"})
+            if kalk.get("tobb_verzio"):
+                sor["megjegyzes"] = (sor["megjegyzes"] + " | " if sor["megjegyzes"] else "") + \
+                    "több mentett kalkuláció, a legutóbbit vettem"
         if p["anyag"] == 0 and p["munkadij"] == 0 and p["vegszamlak"]:
-            sor["megjegyzes"] = "nincs hozzárendelt költség"
+            sor["megjegyzes"] = (sor["megjegyzes"] + " | " if sor["megjegyzes"] else "") + \
+                "nincs hozzárendelt költség"
         projektek.append(sor)
 
     return projektek, hozzar
