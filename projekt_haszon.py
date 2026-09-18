@@ -9,12 +9,12 @@ Dockerfile:
     COPY projekt_haszon.py .
 
 Env változók (a sheets_kliens Google-OAuth változói mellett):
-    SZAMLAZZ_SHEET_ID               – a Számlázz.hu adatkapcsolat munkafüzete (forrás)
-    SZAMLAZZ_HASZON_SHEET_ID        – az "SQM Projekt haszon" munkafüzet (cél)
+    SZAMLAZZ_SHEET_ID               – a Számlázz.hu adatkapcsolat munkafüzete (forrás ÉS alapból a cél is)
+    SZAMLAZZ_HASZON_SHEET_ID        – OPCIONÁLIS: csak akkor, ha külön munkafüzetbe kell a kimutatás
     SZAMLAZZ_HASZON_SECRET          – a /projekt-haszon/frissit végpont titka
     SZAMLAZZ_ELLENORZO_NAPLO_ID     – a számlaellenőrző naplója (opcionális, alapértelmezés a skill szerinti ID)
-    SZAMLAZZ_ANYAG_SZALLITOK        – vesszővel elválasztott névrészletek, amelyek anyagszállítót jelölnek
-                                      (alapértelmezés: "Sto,ALU-TECHNIKA"); minden más partner = munkadíj
+(Az anyagbeszállítók listája NEM env változó: a cél munkafüzet "Beállítások" lapján van,
+ ott bármikor szerkesztheted deploy nélkül. Az első futáskor jön létre az alapértelmezéssel.)
 
 Végpont:
     GET/POST /projekt-haszon/frissit?secret=...   – teljes frissítés (Innonest-scrape + Sheet-írás), JSON összegzés
@@ -48,6 +48,7 @@ INVOICE_REF_RE = re.compile(r"#(BID-)?(\d{4}-\d+)")     # ugyanaz, mint innonest
 
 PROJEKT_LAP = "Projektek"
 HOZZAR_LAP = "Hozzárendelések"
+BEALL_LAP = "Beállítások"
 NAPLO_ALAP_ID = "1XQO7-kq2dtPhMpZ5ew327vVq-ddW1IFSAReaVLAQQs0"
 
 PROJEKT_OSZLOPOK = [
@@ -88,16 +89,20 @@ def _sorok_dict(sorok, oszlopok=None):
     return ki
 
 
-ANYAG_ALAP = "STO,Murexin,MC Bauchemie,Conica,Eurostep"
+ANYAG_ALAP = ["STO", "Murexin", "MC Bauchemie", "Conica", "Eurostep"]
+
+# A Beállítások lapról beolvasott lista; amíg None, az alapértelmezés érvényes.
+AKTIV_ANYAG_LISTA = None
 
 
-def anyag_szallito_e(partner_nev):
+def anyag_szallito_e(partner_nev, lista=None):
     """Anyagbeszállító-e a partner. SZÓHATÁRRAL illesztünk, nem részstringgel:
     a sima 'in' a "Deli Store"-t is STO-nak vette (élő próbán bukott ki 2026-09-11)."""
-    lista = os.environ.get("SZAMLAZZ_ANYAG_SZALLITOK", ANYAG_ALAP)
-    p = (partner_nev or "")
-    for k in lista.split(","):
-        k = k.strip()
+    if lista is None:
+        lista = AKTIV_ANYAG_LISTA if AKTIV_ANYAG_LISTA is not None else ANYAG_ALAP
+    p = partner_nev or ""
+    for k in lista:
+        k = (k or "").strip()
         if k and re.search(r"(?<![\wáéíóöőúüű])" + re.escape(k) + r"(?![\wáéíóöőúüű])", p, re.IGNORECASE):
             return True
     return False
@@ -361,10 +366,38 @@ async def _innonest_gyujtes_async(kezdo_bidek):
 # ---------------------------------------------------------------- Sheet I/O
 
 def _cel_id():
-    sid = os.environ.get("SZAMLAZZ_HASZON_SHEET_ID")
+    """A kimutatás célja. Alapértelmezésben UGYANAZ a munkafüzet, ahova a Számlázz.hu
+    adatkapcsolat ír — így minden egy helyen van. A Projektek / Hozzárendelések /
+    Beállítások lap nem ütközik a Számlák / Tételek / Napló lappal.
+    SZAMLAZZ_HASZON_SHEET_ID csak akkor kell, ha külön munkafüzetbe akarod tenni."""
+    sid = os.environ.get("SZAMLAZZ_HASZON_SHEET_ID") or os.environ.get("SZAMLAZZ_SHEET_ID")
     if not sid:
-        raise RuntimeError("SZAMLAZZ_HASZON_SHEET_ID nincs beállítva")
+        raise RuntimeError("Sem SZAMLAZZ_HASZON_SHEET_ID, sem SZAMLAZZ_SHEET_ID nincs beállítva")
     return sid
+
+
+def anyagszallitok_olvasas():
+    """Az anyagbeszállítók listája a Beállítások lapról. Ha a lap még nincs meg,
+    létrehozza az alapértelmezett listával — onnantól a Sheetben szerkeszthető,
+    nem kell hozzá Railway-deploy."""
+    cel = _cel_id()
+    if BEALL_LAP not in sk.lapok(cel):
+        sk.lap_letrehozas(BEALL_LAP, ["beallitas", "ertek", "leiras"], sheet_id=cel)
+        sk.ir(f"'{BEALL_LAP}'!A2",
+              [["Anyagbeszállító", n, "Ezek bejövő számlái számítanak ANYAGKÖLTSÉGNEK. "
+                "Új beszállító: új sor, A oszlop = Anyagbeszállító. Minden más partner = munkadíj."]
+               for n in ANYAG_ALAP], sheet_id=cel)
+        log.info("[HASZON] Beállítások lap létrehozva az alapértelmezett beszállítókkal")
+        return list(ANYAG_ALAP)
+
+    lista = []
+    for sor in sk.olvas(f"'{BEALL_LAP}'!A2:B", cel):
+        if len(sor) >= 2 and str(sor[0]).strip().lower().startswith("anyagbeszáll") and str(sor[1]).strip():
+            lista.append(str(sor[1]).strip())
+    if not lista:
+        log.warning("[HASZON] A Beállítások lapon nincs egyetlen anyagbeszállító sem — az alapértelmezést használom")
+        return list(ANYAG_ALAP)
+    return lista
 
 
 def kezi_felulirasok_olvasas():
@@ -377,8 +410,13 @@ def kezi_felulirasok_olvasas():
             for s in d if s.get("bid_kezi") or s.get("kategoria_kezi")}
 
 
+VEDETT_LAPOK = {"Számlák", "Tételek", "Napló"}
+
+
 def kimutatas_iras(projektek, hozzar):
     cel = _cel_id()
+    if VEDETT_LAPOK & {PROJEKT_LAP, HOZZAR_LAP, BEALL_LAP}:      # biztosíték átnevezés ellen
+        raise RuntimeError("A kimutatás lapneve ütközik a Számlázz.hu adatkapcsolat lapjaival")
     meglevo = sk.lapok(cel)
     for nev, fej in ((PROJEKT_LAP, PROJEKT_OSZLOPOK), (HOZZAR_LAP, HOZZAR_OSZLOPOK)):
         if nev not in meglevo:
@@ -395,10 +433,13 @@ def frissites():
     """Teljes futás. Visszaad egy összegzést a végpontnak."""
     from innonest_core import run_in_loop
 
+    global AKTIV_ANYAG_LISTA
     forras = os.environ.get("SZAMLAZZ_SHEET_ID")
     szamlak = _sorok_dict(sk.olvas("'Számlák'!A1:AG", forras))
     tetelek = _sorok_dict(sk.olvas("'Tételek'!A1:P", forras))
     kezi = kezi_felulirasok_olvasas()
+    AKTIV_ANYAG_LISTA = anyagszallitok_olvasas()
+    log.info("[HASZON] Anyagbeszállítók: %s", ", ".join(AKTIV_ANYAG_LISTA))
 
     naplo_index = {}
     try:
@@ -428,6 +469,7 @@ def frissites():
         "bejovo_nincs_bid": sum(1 for h in hozzar if h["irany"] == "Bejövő" and not h["bid_ervenyes"]),
         "kiertekelt": sum(1 for p in projektek if p["allapot"] == "kiértékelt"),
         "nincs_kalkulacio": sum(1 for p in projektek if p["allapot"] == "nincs kalkuláció"),
+        "anyagszallitok": AKTIV_ANYAG_LISTA,
     }
 
 
