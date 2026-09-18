@@ -37,13 +37,15 @@ import re
 from collections import defaultdict
 from datetime import datetime, timezone
 
+import requests
 from flask import request, jsonify
 
 import sheets_kliens as sk
 
 log = logging.getLogger("projekt_haszon")
 
-BID_RE = re.compile(r"BID-\s?(\d{4})-\s?(\d+)")
+BID_RE = re.compile(r"(?<![A-Za-z0-9])BID\s?-?\s?(\d{4})\s?-\s?(\d+)", re.IGNORECASE)
+KIV_RE = re.compile(r"KIV\s*#\s?(\d{4}-\d+)", re.IGNORECASE)   # megrendelőlap-szám a számlán
 INVOICE_REF_RE = re.compile(r"#(BID-)?(\d{4}-\d+)")     # ugyanaz, mint innonest_szamlalo.INVOICE_REF_PATTERN
 
 PROJEKT_LAP = "Projektek"
@@ -110,6 +112,11 @@ def anyag_szallito_e(partner_nev, lista=None):
 
 # ---------------------------------------------------------------- 1. kimenő → BID (Innonest /invoices)
 
+def _acquisition_page_url(offset):
+    """Beszerzési lista lapozási URL-je, a számlalistával azonos mintára."""
+    return f"https://app.innonest.hu/acquisition/index/{offset}/"
+
+
 def kimeno_bid_kinyeres(innonest_szamla_sorok):
     """
     Innonest /invoices nyers sorok [{id: számlaszám, text: teljes sor}] → {számlaszám: BID}.
@@ -134,11 +141,13 @@ def kimeno_bid_kinyeres(innonest_szamla_sorok):
 
 # ---------------------------------------------------------------- 2. bejövő → BID
 
-def bejovo_bid_hozzarendeles(rekord, tetelek, beszerzesek, naplo_index):
+def bejovo_bid_hozzarendeles(rekord, tetelek, beszerzesek, naplo_index, kiv_index=None):
     """
     Egy bejövő számla → (bid, módszer). beszerzesek: [{bid, beszallito, netto}] az Innonest-ből,
     naplo_index: {számlaszám: bid} az ellenőrző naplójából.
+    kiv_index: {megrendelőlap-szám: bid} az Innonest beszerzési listájából.
     """
+    kiv_index = kiv_index or {}
     # a) szöveges BID a számlán
     szovegek = [rekord.get("megjegyzes", ""), rekord.get("rendelesszam", "")]
     szovegek += [t.get("megnevezes", "") + " " + t.get("megjegyzes", "") for t in tetelek]
@@ -161,6 +170,14 @@ def bejovo_bid_hozzarendeles(rekord, tetelek, beszerzesek, naplo_index):
                 jeloltek.append(b["bid"])
         if len(set(jeloltek)) == 1:
             return jeloltek[0], "Innonest megrendelőlap"
+
+    # b2) megrendelőlap-szám a számlán (pl. "KIV #2026-92 számú megrendelő alapján")
+    for sz in szovegek:
+        k = KIV_RE.search(sz or "")
+        if k:
+            b = kiv_index.get(k.group(1))
+            if b:
+                return b, "megrendelőlap-szám"
 
     # c) számlaellenőrző napló
     b = naplo_index.get((rekord.get("szamlaszam") or "").strip())
@@ -202,12 +219,13 @@ def kalkulalt_lekeres(bid):
 
 # ---------------------------------------------------------------- 5. összeállítás (tiszta függvény — tesztelhető)
 
-def kimutatas_osszeallitas(szamlak, tetelek, kimeno_bid, beszerzesek, naplo_index, kezi):
+def kimutatas_osszeallitas(szamlak, tetelek, kimeno_bid, beszerzesek, naplo_index, kezi, kiv_index=None):
     """
     szamlak, tetelek: a Számlázz.hu-Sheet sorai dict-ként.
     kimeno_bid: {számlaszám: bid} az Innonest-ből. kezi: {számlaszám: (bid_kezi, kategoria_kezi)}.
     Visszaad: (projekt_sorok, hozzarendeles_sorok) — mindkettő [dict] a fenti oszlopokkal.
     """
+    kiv_index = kiv_index or {}
     tetel_index = defaultdict(list)
     for t in tetelek:
         tetel_index[(t.get("irany"), str(t.get("szamlazz_id")))].append(t)
@@ -230,7 +248,8 @@ def kimutatas_osszeallitas(szamlak, tetelek, kimeno_bid, beszerzesek, naplo_inde
             modszer = "Innonest számlalista" if bid_auto else ""
             kat_auto = "bevétel"
         else:
-            bid_auto, modszer = bejovo_bid_hozzarendeles(r, tetel_index[(irany, str(r.get("szamlazz_id")))], beszerzesek, naplo_index)
+            bid_auto, modszer = bejovo_bid_hozzarendeles(
+                r, tetel_index[(irany, str(r.get("szamlazz_id")))], beszerzesek, naplo_index, kiv_index)
             kat_auto = ""      # a BID ismeretében állítjuk be lentebb
 
         bid_kezi, kat_kezi = kezi.get(szam, ("", ""))
@@ -309,7 +328,7 @@ async def _innonest_gyujtes_async(kezdo_bidek):
     from playwright.async_api import async_playwright
     from innonest_core import login, load_session, make_browser_args
     from innonest_szamlalo import _scrape_rows, _invoices_page_url, LISTA_OLDALMERET, DATE_PATTERN
-    from szamla_ellenorzo import _get_beszerzesi_sorok, _nyisd_meg_reszletek, ACQUISITION_URL
+    from szamla_ellenorzo import _get_beszerzesi_sorok, _nyisd_meg_reszletek
 
     ev = datetime.now().year
     async with async_playwright() as pw:
@@ -340,20 +359,37 @@ async def _innonest_gyujtes_async(kezdo_bidek):
 
         erdekes_bidek = set(kezdo_bidek) | set(kimeno_bid_kinyeres(szamla_sorok).values())
 
-        # -- beszerzési megrendelőlapok
-        await page.goto(ACQUISITION_URL, wait_until="networkidle")
-        await page.wait_for_timeout(1000)
-        lista = await _get_beszerzesi_sorok(page)
+        # -- beszerzési megrendelőlapok, VÉGIGLAPOZVA
+        # A _get_beszerzesi_sorok csak az aktuális oldalt olvassa; korábban ezért
+        # csak az első 100 sort láttuk, és a régebbi projektek megrendelőlapjai
+        # (pl. BID-2026-259) kimaradtak.
+        lista, latott = [], set()
+        for oldal in range(30):
+            await page.goto(_acquisition_page_url(oldal * LISTA_OLDALMERET), wait_until="networkidle")
+            await page.wait_for_timeout(800)
+            oldal_sorok = await _get_beszerzesi_sorok(page)
+            ujak = [x for x in oldal_sorok if x.get("azonosito") and x["azonosito"] not in latott]
+            if not ujak:
+                break
+            latott.update(x["azonosito"] for x in ujak)
+            lista.extend(ujak)
+            if len(oldal_sorok) < LISTA_OLDALMERET:
+                break
+        log.info("[HASZON] Beszerzési megrendelőlapok: %d sor %d oldalról", len(lista), oldal + 1)
+
         beszerzesek = []
         for s in lista:
             if not s.get("bid") or s["bid"] not in erdekes_bidek:
                 continue
+            kiv_m = KIV_RE.search(s.get("targya", "") or "")
+            s["kiv"] = kiv_m.group(1) if kiv_m else ""
             reszlet = await _nyisd_meg_reszletek(page, s["azonosito"])
             szoveg = (reszlet or {}).get("netto_szoveg", "")
             m = re.search(r"Nett[oó][^\d]{0,20}([\d\s]{3,})\s*(?:Ft|HUF)", szoveg, re.IGNORECASE) or \
                 re.search(r"([\d][\d\s]{2,})\s*(?:Ft|HUF)", szoveg, re.IGNORECASE)
             beszerzesek.append({
                 "bid": s["bid"],
+                "kiv": s.get("kiv", ""),
                 "beszallito": (reszlet or {}).get("beszallito") or s.get("beszallito_lista", ""),
                 "netto": int(m.group(1).replace(" ", "")) if m else 0,
             })
@@ -458,8 +494,9 @@ def frissites():
             kezdo_bidek.add(b)
     szamla_sorok, beszerzesek = run_in_loop(_innonest_gyujtes_async(kezdo_bidek))
     kimeno_bid = kimeno_bid_kinyeres(szamla_sorok)
+    kiv_index = {b["kiv"]: b["bid"] for b in beszerzesek if b.get("kiv") and b.get("bid")}
 
-    projektek, hozzar = kimutatas_osszeallitas(szamlak, tetelek, kimeno_bid, beszerzesek, naplo_index, kezi)
+    projektek, hozzar = kimutatas_osszeallitas(szamlak, tetelek, kimeno_bid, beszerzesek, naplo_index, kezi, kiv_index)
     kimutatas_iras(projektek, hozzar)
 
     return {
@@ -482,7 +519,7 @@ async def _diag_innonest_async(bid):
     from playwright.async_api import async_playwright
     from innonest_core import login, load_session, make_browser_args
     from innonest_szamlalo import _scrape_rows, _invoices_page_url, LISTA_OLDALMERET
-    from szamla_ellenorzo import _get_beszerzesi_sorok, _nyisd_meg_reszletek, ACQUISITION_URL
+    from szamla_ellenorzo import _get_beszerzesi_sorok, _nyisd_meg_reszletek
 
     ki = {"kimeno_szamlasorok": [], "beszerzesek": []}
     async with async_playwright() as pw:
@@ -506,9 +543,19 @@ async def _diag_innonest_async(bid):
                 break
             offset += LISTA_OLDALMERET
 
-        await page.goto(ACQUISITION_URL, wait_until="networkidle")
-        await page.wait_for_timeout(1000)
-        lista = await _get_beszerzesi_sorok(page)
+        lista, latott = [], set()
+        for oldal in range(30):
+            await page.goto(_acquisition_page_url(oldal * LISTA_OLDALMERET), wait_until="networkidle")
+            await page.wait_for_timeout(800)
+            oldal_sorok = await _get_beszerzesi_sorok(page)
+            ujak = [x for x in oldal_sorok if x.get("azonosito") and x["azonosito"] not in latott]
+            if not ujak:
+                break
+            latott.update(x["azonosito"] for x in ujak)
+            lista.extend(ujak)
+            if len(oldal_sorok) < LISTA_OLDALMERET:
+                break
+        ki["acquisition_oldalak"] = oldal + 1
         ki["acquisition_osszes_sor"] = len(lista)
         ki["acquisition_bid_talalatok"] = sum(1 for s in lista if s.get("bid"))
         for s in lista:
@@ -532,61 +579,102 @@ async def _diag_innonest_async(bid):
     return ki
 
 
+FIRESTORE_API = "https://firestore.googleapis.com/v1"
+
+
+def _firestore_ut(utvonal=""):
+    pid = os.environ.get("SZAMLAZZ_FIREBASE_PROJECT_ID")
+    if not pid:
+        raise RuntimeError("SZAMLAZZ_FIREBASE_PROJECT_ID nincs beállítva")
+    return f"{FIRESTORE_API}/projects/{pid}/databases/(default)/documents{utvonal}"
+
+
+def _fs_ertek(v):
+    """Firestore REST érték → sima Python érték."""
+    if not isinstance(v, dict):
+        return v
+    for k, ki in (("stringValue", str), ("integerValue", int), ("doubleValue", float),
+                  ("booleanValue", bool), ("timestampValue", str)):
+        if k in v:
+            try:
+                return ki(v[k])
+            except (TypeError, ValueError):
+                return v[k]
+    if "nullValue" in v:
+        return None
+    if "arrayValue" in v:
+        return [_fs_ertek(x) for x in v["arrayValue"].get("values", [])]
+    if "mapValue" in v:
+        return {k: _fs_ertek(x) for k, x in v["mapValue"].get("fields", {}).items()}
+    return v
+
+
+def _fs_dok(d):
+    return {k: _fs_ertek(v) for k, v in (d.get("fields") or {}).items()}
+
+
 def _diag_firestore(bid):
     """Felderíti a webapp Firestore-tárolását: milyen collectionök vannak, és
     melyikben található az adott BID — mezőnevekkel együtt."""
     ki = {"elerheto": False}
     try:
-        import json as _json
-        import firebase_admin
-        from firebase_admin import credentials, firestore
-    except ImportError as e:
-        ki["hiba"] = f"firebase_admin nincs telepítve: {e}"
+        fejlec = {"Authorization": "Bearer " + sk.access_token()}
+    except Exception as e:  # noqa: BLE001
+        ki["hiba"] = f"OAuth token nem szerezhető: {e}"
         return ki
 
     try:
-        if not firebase_admin._apps:
-            nyers = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON")
-            if not nyers:
-                ki["hiba"] = "FIREBASE_SERVICE_ACCOUNT_JSON nincs beállítva a Railway-en"
-                return ki
-            firebase_admin.initialize_app(credentials.Certificate(_json.loads(nyers)))
-        db = firestore.client()
+        # gyökér-collectionök listázása
+        r = requests.post(_firestore_ut() + ":listCollectionIds", headers=fejlec,
+                          json={"pageSize": 100}, timeout=30)
+        if r.status_code == 403:
+            ki["hiba"] = ("403 — a refresh tokenhez hiányzik a datastore jogosultság. "
+                          "Futtasd újra az oauth_token_szerzo.py-t a bővített hatókörrel.")
+            return ki
+        if r.status_code >= 400:
+            ki["hiba"] = f"Firestore {r.status_code}: {r.text[:300]}"
+            return ki
         ki["elerheto"] = True
+        collection_nevek = r.json().get("collectionIds", [])
+        ki["collection_nevek"] = collection_nevek
 
         ki["collectionok"] = []
-        for coll in db.collections():
-            nev = coll.id
+        for nev in collection_nevek[:25]:
             info = {"collection": nev, "minta_dokumentumok": [], "bid_talalat": None}
-            for doc in coll.limit(3).stream():
-                d = doc.to_dict() or {}
-                info["minta_dokumentumok"].append({
-                    "id": doc.id,
-                    "mezok": sorted(d.keys()),
-                    "ertek_minta": {k: str(v)[:120] for k, v in list(d.items())[:12]},
-                })
-            # a BID keresése: dokumentum-azonosítóként és néhány szokásos mezőnévben
-            try:
-                d = coll.document(bid).get()
-                if d.exists:
-                    adat = d.to_dict() or {}
-                    info["bid_talalat"] = {"hol": "dokumentum-azonosító",
-                                           "mezok": sorted(adat.keys()),
-                                           "ertekek": {k: str(v)[:200] for k, v in adat.items()}}
-            except Exception:
-                pass
-            if not info["bid_talalat"]:
+            m = requests.get(_firestore_ut(f"/{nev}"), headers=fejlec,
+                             params={"pageSize": 3}, timeout=30)
+            if m.status_code < 400:
+                for d in m.json().get("documents", []):
+                    adat = _fs_dok(d)
+                    info["minta_dokumentumok"].append({
+                        "id": d.get("name", "").rsplit("/", 1)[-1],
+                        "mezok": sorted(adat.keys()),
+                        "ertek_minta": {k: str(v)[:120] for k, v in list(adat.items())[:15]},
+                    })
+            # BID mint dokumentum-azonosító
+            d = requests.get(_firestore_ut(f"/{nev}/{bid}"), headers=fejlec, timeout=30)
+            if d.status_code < 400:
+                adat = _fs_dok(d.json())
+                info["bid_talalat"] = {"hol": "dokumentum-azonosító", "mezok": sorted(adat.keys()),
+                                       "ertekek": {k: str(v)[:200] for k, v in adat.items()}}
+            else:
                 for mezo in ("bid", "BID", "bidSzam", "bid_szam", "projektBid", "azonosito", "projectId"):
-                    try:
-                        tal = list(coll.where(mezo, "==", bid).limit(1).stream())
-                        if tal:
-                            adat = tal[0].to_dict() or {}
-                            info["bid_talalat"] = {"hol": f"mező: {mezo}", "doc_id": tal[0].id,
-                                                   "mezok": sorted(adat.keys()),
-                                                   "ertekek": {k: str(v)[:200] for k, v in adat.items()}}
-                            break
-                    except Exception:
+                    q = requests.post(_firestore_ut() + ":runQuery", headers=fejlec, timeout=30, json={
+                        "structuredQuery": {
+                            "from": [{"collectionId": nev}],
+                            "where": {"fieldFilter": {"field": {"fieldPath": mezo}, "op": "EQUAL",
+                                                      "value": {"stringValue": bid}}},
+                            "limit": 1}})
+                    if q.status_code >= 400:
                         continue
+                    tal = [x["document"] for x in q.json() if x.get("document")]
+                    if tal:
+                        adat = _fs_dok(tal[0])
+                        info["bid_talalat"] = {"hol": f"mező: {mezo}",
+                                               "doc_id": tal[0].get("name", "").rsplit("/", 1)[-1],
+                                               "mezok": sorted(adat.keys()),
+                                               "ertekek": {k: str(v)[:200] for k, v in adat.items()}}
+                        break
             ki["collectionok"].append(info)
     except Exception as e:  # noqa: BLE001
         ki["hiba"] = f"{type(e).__name__}: {e}"
@@ -599,6 +687,7 @@ def _diag_szamlak(bid):
     forras = os.environ.get("SZAMLAZZ_SHEET_ID")
     szamlak = _sorok_dict(sk.olvas("'Számlák'!A1:AG", forras))
     tetelek = _sorok_dict(sk.olvas("'Tételek'!A1:P", forras))
+    kiv_index = kiv_index or {}
     tetel_index = defaultdict(list)
     for t in tetelek:
         tetel_index[(t.get("irany"), str(t.get("szamlazz_id")))].append(t)
@@ -607,7 +696,7 @@ def _diag_szamlak(bid):
     for r in szamlak:
         ts = tetel_index[(r.get("irany"), str(r.get("szamlazz_id")))]
         szovegek = " | ".join([r.get("megjegyzes", ""), r.get("rendelesszam", "")] +
-                              [t.get("megnevezes", "") for t in ts])
+                              [(t.get("megnevezes", "") + " " + t.get("megjegyzes", "")).strip() for t in ts])
         sor = {"szamlaszam": r.get("szamlaszam"), "partner": r.get("partner_nev"),
                "netto_huf": _num(r.get("netto_huf")), "kelt": r.get("kelt"),
                "tipus": r.get("tipus"), "tetelszovegek": szovegek[:300]}
