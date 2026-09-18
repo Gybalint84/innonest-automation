@@ -21,5 +21,6 @@ COPY innonest_szamlalo.py .
 COPY billingo_teljesitmeny.py .
 COPY szamlazz_adatkapcsolat.py .
 COPY sheets_kliens.py .
+COPY projekt_haszon.py .
 EXPOSE 5000
 CMD ["python", "server.py"]
