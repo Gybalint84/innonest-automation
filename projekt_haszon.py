@@ -473,6 +473,175 @@ def frissites():
     }
 
 
+
+
+# ---------------------------------------------------------------- DIAGNOSZTIKA
+
+async def _diag_innonest_async(bid):
+    """Nyersen visszaadja, mit lát az Innonest az adott BID-hez."""
+    from playwright.async_api import async_playwright
+    from innonest_core import login, load_session, make_browser_args
+    from innonest_szamlalo import _scrape_rows, _invoices_page_url, LISTA_OLDALMERET
+    from szamla_ellenorzo import _get_beszerzesi_sorok, _nyisd_meg_reszletek, ACQUISITION_URL
+
+    ki = {"kimeno_szamlasorok": [], "beszerzesek": []}
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True, args=make_browser_args())
+        context = await browser.new_context(viewport={"width": 1400, "height": 900})
+        await load_session(context)
+        page = await context.new_page()
+
+        offset = 0
+        for _ in range(50):
+            sorok = await _scrape_rows(page, _invoices_page_url(offset))
+            if "login" in page.url:
+                await login(page)
+                sorok = await _scrape_rows(page, _invoices_page_url(offset))
+            if not sorok:
+                break
+            for r in sorok:
+                if bid.replace("BID-", "") in r.get("text", ""):
+                    ki["kimeno_szamlasorok"].append({"id": r.get("id"), "text": r.get("text", "")[:400]})
+            if len(sorok) < LISTA_OLDALMERET:
+                break
+            offset += LISTA_OLDALMERET
+
+        await page.goto(ACQUISITION_URL, wait_until="networkidle")
+        await page.wait_for_timeout(1000)
+        lista = await _get_beszerzesi_sorok(page)
+        ki["acquisition_osszes_sor"] = len(lista)
+        ki["acquisition_bid_talalatok"] = sum(1 for s in lista if s.get("bid"))
+        for s in lista:
+            if s.get("bid") != bid:
+                continue
+            reszlet = await _nyisd_meg_reszletek(page, s["azonosito"]) or {}
+            szoveg = reszlet.get("netto_szoveg", "")
+            m = re.search(r"Nett[oó][^\d]{0,20}([\d\s]{3,})\s*(?:Ft|HUF)", szoveg, re.IGNORECASE) or \
+                re.search(r"([\d][\d\s]{2,})\s*(?:Ft|HUF)", szoveg, re.IGNORECASE)
+            ki["beszerzesek"].append({
+                "azonosito": s["azonosito"],
+                "targya": s.get("targya", "")[:200],
+                "beszallito_lista": s.get("beszallito_lista", ""),
+                "modal_beszallito": reszlet.get("beszallito", ""),
+                "kiolvasott_netto": int(m.group(1).replace(" ", "")) if m else None,
+                "modal_szoveg_eleje": szoveg[:1200],
+                "modal_szoveg_hossz": len(szoveg),
+                "osszes_szam_a_modalban": re.findall(r"[\d][\d\s]{2,}\s*(?:Ft|HUF)", szoveg)[:20],
+            })
+        await browser.close()
+    return ki
+
+
+def _diag_firestore(bid):
+    """Felderíti a webapp Firestore-tárolását: milyen collectionök vannak, és
+    melyikben található az adott BID — mezőnevekkel együtt."""
+    ki = {"elerheto": False}
+    try:
+        import json as _json
+        import firebase_admin
+        from firebase_admin import credentials, firestore
+    except ImportError as e:
+        ki["hiba"] = f"firebase_admin nincs telepítve: {e}"
+        return ki
+
+    try:
+        if not firebase_admin._apps:
+            nyers = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON")
+            if not nyers:
+                ki["hiba"] = "FIREBASE_SERVICE_ACCOUNT_JSON nincs beállítva a Railway-en"
+                return ki
+            firebase_admin.initialize_app(credentials.Certificate(_json.loads(nyers)))
+        db = firestore.client()
+        ki["elerheto"] = True
+
+        ki["collectionok"] = []
+        for coll in db.collections():
+            nev = coll.id
+            info = {"collection": nev, "minta_dokumentumok": [], "bid_talalat": None}
+            for doc in coll.limit(3).stream():
+                d = doc.to_dict() or {}
+                info["minta_dokumentumok"].append({
+                    "id": doc.id,
+                    "mezok": sorted(d.keys()),
+                    "ertek_minta": {k: str(v)[:120] for k, v in list(d.items())[:12]},
+                })
+            # a BID keresése: dokumentum-azonosítóként és néhány szokásos mezőnévben
+            try:
+                d = coll.document(bid).get()
+                if d.exists:
+                    adat = d.to_dict() or {}
+                    info["bid_talalat"] = {"hol": "dokumentum-azonosító",
+                                           "mezok": sorted(adat.keys()),
+                                           "ertekek": {k: str(v)[:200] for k, v in adat.items()}}
+            except Exception:
+                pass
+            if not info["bid_talalat"]:
+                for mezo in ("bid", "BID", "bidSzam", "bid_szam", "projektBid", "azonosito", "projectId"):
+                    try:
+                        tal = list(coll.where(mezo, "==", bid).limit(1).stream())
+                        if tal:
+                            adat = tal[0].to_dict() or {}
+                            info["bid_talalat"] = {"hol": f"mező: {mezo}", "doc_id": tal[0].id,
+                                                   "mezok": sorted(adat.keys()),
+                                                   "ertekek": {k: str(v)[:200] for k, v in adat.items()}}
+                            break
+                    except Exception:
+                        continue
+            ki["collectionok"].append(info)
+    except Exception as e:  # noqa: BLE001
+        ki["hiba"] = f"{type(e).__name__}: {e}"
+    return ki
+
+
+def _diag_szamlak(bid):
+    """Mit mond a Sheet: mely számlák kapcsolódnak a BID-hez, és a BID nélküli
+    bejövő számlák közül melyek jöhetnének szóba (szállító + összeg szerint)."""
+    forras = os.environ.get("SZAMLAZZ_SHEET_ID")
+    szamlak = _sorok_dict(sk.olvas("'Számlák'!A1:AG", forras))
+    tetelek = _sorok_dict(sk.olvas("'Tételek'!A1:P", forras))
+    tetel_index = defaultdict(list)
+    for t in tetelek:
+        tetel_index[(t.get("irany"), str(t.get("szamlazz_id")))].append(t)
+
+    kimeno, bejovo_bides, bejovo_nelkul = [], [], []
+    for r in szamlak:
+        ts = tetel_index[(r.get("irany"), str(r.get("szamlazz_id")))]
+        szovegek = " | ".join([r.get("megjegyzes", ""), r.get("rendelesszam", "")] +
+                              [t.get("megnevezes", "") for t in ts])
+        sor = {"szamlaszam": r.get("szamlaszam"), "partner": r.get("partner_nev"),
+               "netto_huf": _num(r.get("netto_huf")), "kelt": r.get("kelt"),
+               "tipus": r.get("tipus"), "tetelszovegek": szovegek[:300]}
+        if r.get("irany") == "Kimenő":
+            if bid_normalizal(szovegek) == bid:
+                kimeno.append(sor)
+        else:
+            if bid_normalizal(szovegek) == bid:
+                bejovo_bides.append(sor)
+            elif _num(r.get("netto_huf")) > 50000 and r.get("tipus") == "Számla":
+                bejovo_nelkul.append(sor)
+    bejovo_nelkul.sort(key=lambda x: -x["netto_huf"])
+    return {"kimeno_szoveges_bid_talalat": kimeno,
+            "bejovo_szoveges_bid_talalat": bejovo_bides,
+            "bid_nelkuli_nagy_bejovo_szamlak": bejovo_nelkul[:40],
+            "megjegyzes": "A 'bid_nelkuli...' lista csak 50.000 Ft feletti bejövő SZÁMLÁKAT mutat, "
+                          "csökkenő nettó szerint — ezek a jelöltek a kézi hozzárendeléshez."}
+
+
+def diagnosztika(bid):
+    from innonest_core import run_in_loop
+    ki = {"bid": bid, "sheet": {}, "innonest": {}, "firestore": {}}
+    try:
+        ki["sheet"] = _diag_szamlak(bid)
+    except Exception as e:  # noqa: BLE001
+        ki["sheet"] = {"hiba": f"{type(e).__name__}: {e}"}
+    try:
+        ki["innonest"] = run_in_loop(_diag_innonest_async(bid))
+    except Exception as e:  # noqa: BLE001
+        ki["innonest"] = {"hiba": f"{type(e).__name__}: {e}"}
+    ki["firestore"] = _diag_firestore(bid)
+    return ki
+
+
 # ---------------------------------------------------------------- Flask
 
 def register_projekt_haszon_routes(app):
@@ -488,4 +657,19 @@ def register_projekt_haszon_routes(app):
             log.exception("[HASZON] frissítés hiba")
             return jsonify({"ok": False, "error": str(e)}), 500
 
-    log.info("[HASZON] Végpont regisztrálva: /projekt-haszon/frissit")
+    @app.route("/projekt-haszon/diagnosztika", methods=["GET"])
+    def projekt_haszon_diag():
+        titok = os.environ.get("SZAMLAZZ_HASZON_SECRET", "")
+        if not titok or request.args.get("secret") != titok:
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
+        bid = bid_normalizal(request.args.get("bid", ""))
+        if not bid:
+            return jsonify({"ok": False, "error": "hiányzó vagy hibás bid paraméter "
+                                                  "(pl. ?bid=BID-2026-259)"}), 400
+        try:
+            return jsonify({"ok": True, **diagnosztika(bid)})
+        except Exception as e:  # noqa: BLE001
+            log.exception("[HASZON] diagnosztika hiba")
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    log.info("[HASZON] Végpontok regisztrálva: /projekt-haszon/frissit, /projekt-haszon/diagnosztika")
