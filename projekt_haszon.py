@@ -121,6 +121,38 @@ ACQ_ALAP = "https://app.innonest.hu/acquisition"
 ACQ_OLDAL = ACQ_ALAP + "/index/{o}/"
 
 
+SOR_KIOLVASO = """
+() => {
+    const out = [];
+    document.querySelectorAll('table.table-softservice tbody tr').forEach(tr => {
+        const link = tr.querySelector('td.left.bold a');
+        if (!link) return;
+        out.push({ id: link.innerText.trim(), text: tr.innerText });
+    });
+    return out;
+}
+"""
+
+
+async def _lista_sorok(page, url, timeout=25000):
+    """Egy Innonest listaoldal sorai. Nem dob kivételt: hiba esetén (None) tér vissza.
+
+    A dashboard _scrape_rows függvénye networkidle-t vár — ez az oldalon néha sosem
+    következik be, és időtúllépéssel megöli a futást. Itt domcontentloaded után
+    megvárjuk, hogy a táblázat megjelenjen."""
+    if not await _acq_betolt(page, url, timeout=timeout):
+        return None
+    try:
+        await page.wait_for_selector("table.table-softservice tbody tr", timeout=10000)
+    except Exception:  # noqa: BLE001 — üres lista is lehet, nem hiba
+        pass
+    try:
+        return await page.evaluate(SOR_KIOLVASO)
+    except Exception as e:  # noqa: BLE001
+        log.warning("[HASZON] Sorok kiolvasása sikertelen (%s): %s", url, str(e)[:120])
+        return None
+
+
 async def _acq_betolt(page, url, timeout=20000):
     """Oldalbetöltés, ami nem dönti el a futást. True, ha sikerült."""
     try:
@@ -139,12 +171,12 @@ async def _acq_lista(page, get_sorok, max_oldal=30):
     lista, latott = [], set()
     for oldal in range(max_oldal):
         url = ACQ_OLDAL.format(o=oldal * LISTA_OLDALMERET)
-        if not await _acq_betolt(page, url):
+        sorok = await get_sorok(page, url)
+        if sorok is None:
             gond = f"a beszerzési lista {oldal + 1}. oldala nem tölthető be ({url})"
             if oldal == 0:
                 return [], gond
             return lista, gond + f" — csak {len(lista)} sort látunk, az anyagköltség hiányos lehet"
-        sorok = await get_sorok(page)
         ujak = [x for x in sorok if x.get("azonosito") and x["azonosito"] not in latott]
         latott.update(x["azonosito"] for x in ujak)
         lista.extend(ujak)
@@ -550,7 +582,7 @@ async def _innonest_gyujtes_async(kezdo_bidek):
     (modált csak azokhoz a BID-ekhez nyitunk, amelyek a kimenő számlákon vagy a kézi listán szerepelnek)."""
     from playwright.async_api import async_playwright
     from innonest_core import login, load_session, make_browser_args
-    from innonest_szamlalo import _scrape_rows, _invoices_page_url, DATE_PATTERN
+    from innonest_szamlalo import _invoices_page_url, DATE_PATTERN
     from szamla_ellenorzo import _get_beszerzesi_sorok, _nyisd_meg_reszletek
 
     ev = datetime.now().year
@@ -561,12 +593,15 @@ async def _innonest_gyujtes_async(kezdo_bidek):
         page = await context.new_page()
 
         # -- kimenő számlák
-        szamla_sorok, offset = [], 0
+        szamla_sorok, offset, szamla_gond = [], 0, ""
         for _ in range(50):
-            sorok = await _scrape_rows(page, _invoices_page_url(offset))
-            if "login" in page.url:
+            sorok = await _lista_sorok(page, _invoices_page_url(offset))
+            if sorok is not None and "login" in page.url:
                 await login(page)
-                sorok = await _scrape_rows(page, _invoices_page_url(offset))
+                sorok = await _lista_sorok(page, _invoices_page_url(offset))
+            if sorok is None:
+                szamla_gond = f"a kimenő számlalista {offset // LISTA_OLDALMERET + 1}. oldala nem olvasható"
+                break
             if not sorok:
                 break
             elozo_ev = False
@@ -583,9 +618,20 @@ async def _innonest_gyujtes_async(kezdo_bidek):
         erdekes_bidek = set(kezdo_bidek) | set(kimeno_bid_kinyeres(szamla_sorok).values())
 
         # -- beszerzési megrendelőlapok
-        lista, lapozas_gond = await _acq_lista(page, _get_beszerzesi_sorok)
+        async def beszerzesi_oldal(p, url):
+            if not await _acq_betolt(p, url):
+                return None
+            try:
+                return await _get_beszerzesi_sorok(p)
+            except Exception as e:  # noqa: BLE001
+                log.warning("[HASZON] Beszerzési sorok olvasása sikertelen: %s", str(e)[:120])
+                return None
+
+        lista, lapozas_gond = await _acq_lista(page, beszerzesi_oldal)
         if lapozas_gond:
             log.warning("[HASZON] %s", lapozas_gond)
+        if szamla_gond:
+            lapozas_gond = (lapozas_gond + " | " if lapozas_gond else "") + szamla_gond
         log.info("[HASZON] Beszerzési megrendelőlapok: %d sor", len(lista))
 
         beszerzesek = []
@@ -753,7 +799,7 @@ async def _diag_innonest_async(bid):
     """Nyersen visszaadja, mit lát az Innonest az adott BID-hez."""
     from playwright.async_api import async_playwright
     from innonest_core import login, load_session, make_browser_args
-    from innonest_szamlalo import _scrape_rows, _invoices_page_url
+    from innonest_szamlalo import _invoices_page_url
     from szamla_ellenorzo import _get_beszerzesi_sorok, _nyisd_meg_reszletek
 
     ki = {"kimeno_szamlasorok": [], "beszerzesek": []}
@@ -765,10 +811,10 @@ async def _diag_innonest_async(bid):
 
         offset = 0
         for _ in range(50):
-            sorok = await _scrape_rows(page, _invoices_page_url(offset))
-            if "login" in page.url:
+            sorok = await _lista_sorok(page, _invoices_page_url(offset))
+            if sorok is not None and "login" in page.url:
                 await login(page)
-                sorok = await _scrape_rows(page, _invoices_page_url(offset))
+                sorok = await _lista_sorok(page, _invoices_page_url(offset))
             if not sorok:
                 break
             for r in sorok:
@@ -778,7 +824,16 @@ async def _diag_innonest_async(bid):
                 break
             offset += LISTA_OLDALMERET
 
-        lista, lapozas_gond = await _acq_lista(page, _get_beszerzesi_sorok)
+        async def beszerzesi_oldal(p, url):
+            if not await _acq_betolt(p, url):
+                return None
+            try:
+                return await _get_beszerzesi_sorok(p)
+            except Exception as e:  # noqa: BLE001
+                log.warning("[HASZON] Beszerzési sorok olvasása sikertelen: %s", str(e)[:120])
+                return None
+
+        lista, lapozas_gond = await _acq_lista(page, beszerzesi_oldal)
         ki["lapozas_gond"] = lapozas_gond or ""
         ki["acquisition_osszes_sor"] = len(lista)
         ki["acquisition_bid_lista"] = sorted({x["bid"] for x in lista if x.get("bid")})[:200]
