@@ -57,7 +57,8 @@ PROJEKT_OSZLOPOK = [
     "bid", "ugyfel", "vegszamlak", "elolegszamlak",
     "bevetel_netto_huf", "anyag_tenyleges", "munkadij_tenyleges", "haszon_tenyleges",
     "kalk_bevetel", "kalk_anyag", "kalk_munkadij", "kalk_haszon",
-    "elteres_ft", "elteres_pct", "sajat_csapat", "allapot", "megjegyzes", "frissitve",
+    "elteres_ft", "elteres_pct", "sajat_csapat",
+    "anyag_beszallitonkent", "alvallalkozonkent", "allapot", "megjegyzes", "frissitve",
 ]
 HOZZAR_OSZLOPOK = [
     "szamlaszam", "irany", "tipus", "kelt", "partner_nev", "netto_huf",
@@ -231,6 +232,57 @@ def naplo_index_epites(naplo_sorok):
 SAJAT_CSAPAT_KULCS = "Saját csapat"
 
 
+# A kalkulátorban használt nevek és a számlán szereplő cégnevek nem egyeznek
+# ("Roliék" → "V-Clean&Services Kft"). A megfeleltetést a Beállítások lap tartalmazza,
+# hogy Sheetből szerkeszthető legyen, deploy nélkül.
+AKTIV_NEVMEGFELELTETES = None
+
+NEVMEGFELELTETES_ALAP = {"roliék": "V-Clean"}
+
+
+def _nev_kulcs(n):
+    return " ".join(str(n or "").lower().split())
+
+
+def szamlazo_nev(kalk_nev, megfeleltetes=None):
+    """Kalkulátorbeli név → a számlán keresendő névrészlet."""
+    if megfeleltetes is None:
+        megfeleltetes = AKTIV_NEVMEGFELELTETES if AKTIV_NEVMEGFELELTETES is not None else NEVMEGFELELTETES_ALAP
+    return megfeleltetes.get(_nev_kulcs(kalk_nev), kalk_nev or "")
+
+
+def nev_egyezik(kalk_nev, partner_nev, megfeleltetes=None):
+    """Illeszkedik-e a kalkulátorbeli név a számla partnernevére."""
+    keresett = _nev_kulcs(szamlazo_nev(kalk_nev, megfeleltetes))
+    partner = _nev_kulcs(partner_nev)
+    if not keresett or not partner:
+        return False
+    return keresett in partner or partner in keresett
+
+
+def _totals_tetelek(totals, kulcs):
+    """snap.totals.anyag / .alvallalkozo tömb → egységes [dict]. Tűri a régi,
+    objektumos alakot is ({"STO": 1240000})."""
+    nyers = (totals or {}).get(kulcs)
+    ki = []
+    if isinstance(nyers, list):
+        for t in nyers:
+            if not isinstance(t, dict):
+                continue
+            osszeg = t.get("osszeg")
+            if not isinstance(osszeg, (int, float)) or isinstance(osszeg, bool):
+                continue
+            ki.append({"nev": (t.get("beszallito") or t.get("nev") or "").strip(),
+                       "osszeg": float(osszeg),
+                       "sajat": bool(t.get("sajat"))})
+    elif isinstance(nyers, dict):
+        for nev, osszeg in nyers.items():
+            if isinstance(osszeg, (int, float)) and not isinstance(osszeg, bool):
+                ki.append({"nev": str(nev).strip(), "osszeg": float(osszeg),
+                           "sajat": str(nev).strip() == SAJAT_CSAPAT_KULCS})
+    return ki
+
+
 def _kalk_alvallalkozoi(alv):
     """Az ALKALMAZOTT alvállalkozói díj és hogy saját csapattal számoltunk-e.
     Visszaad: (díj vagy None, sajat_csapat bool, megjegyzés)."""
@@ -277,12 +329,19 @@ def kalkulalt_lekeres(bid):
         meta = snap.get("meta") or {}
         totals = snap.get("totals") or {}
 
-        alv_dij, sajat, alv_megj = _kalk_alvallalkozoi(snap.get("ALV"))
-        anyag = totals.get("anyagKalk", totals.get("anyag"))
-        munkadij = totals.get("alvKalk", totals.get("munkadij", alv_dij))
+        anyag_tetelek = _totals_tetelek(totals, "anyag")
+        alv_tetelek = _totals_tetelek(totals, "alvallalkozo")
+
+        anyag = sum(t["osszeg"] for t in anyag_tetelek) if anyag_tetelek else \
+            totals.get("anyagOsszesen", totals.get("anyagKalk"))
+        if alv_tetelek:
+            munkadij = sum(t["osszeg"] for t in alv_tetelek)
+            sajat = any(t["sajat"] for t in alv_tetelek)
+            alv_megj = ""
+        else:
+            munkadij, sajat, alv_megj = _kalk_alvallalkozoi(snap.get("ALV"))
+            munkadij = totals.get("alvOsszesen", totals.get("alvKalk", munkadij))
         bevetel = totals.get("ajanlatNetto", totals.get("bevetel"))
-        if isinstance(totals.get("sajatCsapat"), bool):
-            sajat = totals["sajatCsapat"]
 
         hianyzo = []
         if anyag is None:
@@ -291,8 +350,12 @@ def kalkulalt_lekeres(bid):
             hianyzo.append(alv_megj or "kalkulált alvállalkozói díj")
 
         return {"bevetel": bevetel, "anyag": anyag, "munkadij": munkadij,
+                "anyag_tetelek": anyag_tetelek, "alv_tetelek": alv_tetelek,
                 "sajat_csapat": sajat, "ugyfel": meta.get("ceg") or "",
                 "projekt_nev": meta.get("nev") or d.get("name") or "",
+                "devizanem": totals.get("devizanem") or "HUF",
+                "margin": totals.get("margin") or (snap.get("AJ") or {}).get("margin"),
+                "szamitva": totals.get("szamitva"),
                 "tobb_verzio": len(dokok) > 1, "hianyzo": hianyzo}
     except Exception as e:  # noqa: BLE001
         log.warning("[HASZON] kalkulált érték nem olvasható (%s): %s", bid, e)
@@ -300,6 +363,36 @@ def kalkulalt_lekeres(bid):
 
 
 # ---------------------------------------------------------------- 5. összeállítás (tiszta függvény — tesztelhető)
+
+def _ft(x):
+    """Ezres elválasztós szám — csak a számra, nem az egész mondatra."""
+    return f"{x:,.0f}".replace(",", " ")
+
+
+def _beszallitonkenti_elteres(kalk_tetelek, tenyleges):
+    """kalk_tetelek: [{nev, osszeg, sajat}], tenyleges: {partner_nev: összeg}.
+    Név alapján párosít (a Beállítások lap megfeleltetésével), és megmutatja,
+    kinél mennyi a terv és a tény."""
+    sorok, felhasznalt = [], set()
+    for t in sorted(kalk_tetelek, key=lambda x: -x["osszeg"]):
+        if t.get("sajat"):
+            sorok.append(f"{t['nev']}: terv {_ft(t['osszeg'])} / tény — (saját csapat, nincs számla)")
+            continue
+        tny, kik = 0.0, []
+        for partner, osszeg in tenyleges.items():
+            if nev_egyezik(t["nev"], partner):
+                tny += osszeg
+                kik.append(partner)
+                felhasznalt.add(partner)
+        elteres = tny - t["osszeg"]
+        pct = f" ({elteres / t['osszeg'] * 100:+.0f}%)" if t["osszeg"] else ""
+        jelzes = "" if kik else " [nincs hozzá számla]"
+        sorok.append(f"{t['nev']}: terv {_ft(t['osszeg'])} / tény {_ft(tny)}{pct}{jelzes}")
+    for partner, osszeg in sorted(tenyleges.items(), key=lambda x: -x[1]):
+        if partner not in felhasznalt:
+            sorok.append(f"{partner}: terv — / tény {_ft(osszeg)} (nem volt kalkulálva)")
+    return " | ".join(sorok)
+
 
 def kimutatas_osszeallitas(szamlak, tetelek, kimeno_bid, beszerzesek, naplo_index, kezi, kiv_index=None):
     """
@@ -351,7 +444,7 @@ def kimutatas_osszeallitas(szamlak, tetelek, kimeno_bid, beszerzesek, naplo_inde
 
     # projektenkénti összegzés
     proj = defaultdict(lambda: {"vegszamlak": [], "elolegszamlak": [], "bevetel": 0.0, "anyag": 0.0,
-                                "munkadij": 0.0, "ugyfel": ""})
+                                "munkadij": 0.0, "ugyfel": "", "anyag_partner": {}, "alv_partner": {}})
     for h in hozzar:
         b = h["bid_ervenyes"]
         if not b:
@@ -361,10 +454,12 @@ def kimutatas_osszeallitas(szamlak, tetelek, kimeno_bid, beszerzesek, naplo_inde
             p["bevetel"] += h["netto_huf"]
             p["ugyfel"] = p["ugyfel"] or h["partner_nev"]
             (p["elolegszamlak"] if h["tipus"] == "Előlegszámla" else p["vegszamlak"]).append(h["szamlaszam"])
-        elif h["kategoria_ervenyes"] == "anyag":
-            p["anyag"] += h["netto_huf"]
-        elif h["kategoria_ervenyes"] == "munkadíj":
-            p["munkadij"] += h["netto_huf"]
+        elif h["kategoria_ervenyes"] in ("anyag", "munkadíj"):
+            mezo = "anyag" if h["kategoria_ervenyes"] == "anyag" else "munkadij"
+            p[mezo] += h["netto_huf"]
+            reszletek = p["anyag_partner" if mezo == "anyag" else "alv_partner"]
+            nev = h["partner_nev"] or "(névtelen)"
+            reszletek[nev] = reszletek.get(nev, 0.0) + h["netto_huf"]
 
     most = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
     projektek = []
@@ -378,7 +473,8 @@ def kimutatas_osszeallitas(szamlak, tetelek, kimeno_bid, beszerzesek, naplo_inde
             "bevetel_netto_huf": round(p["bevetel"]), "anyag_tenyleges": round(p["anyag"]),
             "munkadij_tenyleges": round(p["munkadij"]), "haszon_tenyleges": round(haszon),
             "kalk_bevetel": "", "kalk_anyag": "", "kalk_munkadij": "", "kalk_haszon": "",
-            "elteres_ft": "", "elteres_pct": "", "sajat_csapat": "", "megjegyzes": "", "frissitve": most,
+            "elteres_ft": "", "elteres_pct": "", "sajat_csapat": "",
+            "anyag_beszallitonkent": "", "alvallalkozonkent": "", "megjegyzes": "", "frissitve": most,
         }
         if not p["vegszamlak"]:
             sor["allapot"] = "csak előleg"
@@ -387,6 +483,10 @@ def kimutatas_osszeallitas(szamlak, tetelek, kimeno_bid, beszerzesek, naplo_inde
         else:
             sor["ugyfel"] = sor["ugyfel"] or kalk.get("ugyfel", "")
             sor["sajat_csapat"] = "saját csapat is volt kint" if kalk.get("sajat_csapat") else ""
+            if kalk.get("anyag_tetelek"):
+                sor["anyag_beszallitonkent"] = _beszallitonkenti_elteres(kalk["anyag_tetelek"], p["anyag_partner"])
+            if kalk.get("alv_tetelek"):
+                sor["alvallalkozonkent"] = _beszallitonkenti_elteres(kalk["alv_tetelek"], p["alv_partner"])
             for cel, forras_kulcs in (("kalk_bevetel", "bevetel"), ("kalk_anyag", "anyag"),
                                       ("kalk_munkadij", "munkadij")):
                 if kalk.get(forras_kulcs) is not None:
@@ -513,10 +613,14 @@ def anyagszallitok_olvasas():
     cel = _cel_id()
     if BEALL_LAP not in sk.lapok(cel):
         sk.lap_letrehozas(BEALL_LAP, ["beallitas", "ertek", "leiras"], sheet_id=cel)
-        sk.ir(f"'{BEALL_LAP}'!A2",
-              [["Anyagbeszállító", n, "Ezek bejövő számlái számítanak ANYAGKÖLTSÉGNEK. "
-                "Új beszállító: új sor, A oszlop = Anyagbeszállító. Minden más partner = munkadíj."]
-               for n in ANYAG_ALAP], sheet_id=cel)
+        sorok = [["Anyagbeszállító", n, "Ezek bejövő számlái számítanak ANYAGKÖLTSÉGNEK. "
+                  "Új beszállító: új sor, A oszlop = Anyagbeszállító. Minden más partner = munkadíj."]
+                 for n in ANYAG_ALAP]
+        sorok += [["Névmegfeleltetés", k, v] for k, v in NEVMEGFELELTETES_ALAP.items()]
+        sorok.append(["Névmegfeleltetés", "", ""])
+        sorok.append(["", "", "Névmegfeleltetés: B = a kalkulátorban használt név (pl. Roliék), "
+                              "C = a számlán szereplő cégnév részlete (pl. V-Clean)."])
+        sk.ir(f"'{BEALL_LAP}'!A2", sorok, sheet_id=cel)
         log.info("[HASZON] Beállítások lap létrehozva az alapértelmezett beszállítókkal")
         return list(ANYAG_ALAP)
 
@@ -528,6 +632,20 @@ def anyagszallitok_olvasas():
         log.warning("[HASZON] A Beállítások lapon nincs egyetlen anyagbeszállító sem — az alapértelmezést használom")
         return list(ANYAG_ALAP)
     return lista
+
+
+def nevmegfeleltetes_olvasas():
+    """Kalkulátorbeli név → számlán szereplő névrészlet, a Beállítások lapról.
+    Sor: A="Névmegfeleltetés", B=kalkulátorbeli név, C=a számlán keresendő névrészlet."""
+    cel = _cel_id()
+    if BEALL_LAP not in sk.lapok(cel):
+        return dict(NEVMEGFELELTETES_ALAP)
+    ki = {}
+    for sor in sk.olvas(f"'{BEALL_LAP}'!A2:C", cel):
+        if len(sor) >= 3 and str(sor[0]).strip().lower().startswith("névmegfeleltet") \
+                and str(sor[1]).strip() and str(sor[2]).strip():
+            ki[_nev_kulcs(sor[1])] = str(sor[2]).strip()
+    return ki or dict(NEVMEGFELELTETES_ALAP)
 
 
 def kezi_felulirasok_olvasas():
@@ -563,13 +681,16 @@ def frissites():
     """Teljes futás. Visszaad egy összegzést a végpontnak."""
     from innonest_core import run_in_loop
 
-    global AKTIV_ANYAG_LISTA
+    global AKTIV_ANYAG_LISTA, AKTIV_NEVMEGFELELTETES
     forras = os.environ.get("SZAMLAZZ_SHEET_ID")
     szamlak = _sorok_dict(sk.olvas("'Számlák'!A1:AG", forras))
     tetelek = _sorok_dict(sk.olvas("'Tételek'!A1:P", forras))
     kezi = kezi_felulirasok_olvasas()
     AKTIV_ANYAG_LISTA = anyagszallitok_olvasas()
-    log.info("[HASZON] Anyagbeszállítók: %s", ", ".join(AKTIV_ANYAG_LISTA))
+    AKTIV_NEVMEGFELELTETES = nevmegfeleltetes_olvasas()
+    log.info("[HASZON] Anyagbeszállítók: %s | névmegfeleltetés: %s",
+             ", ".join(AKTIV_ANYAG_LISTA),
+             ", ".join(f"{k}→{v}" for k, v in AKTIV_NEVMEGFELELTETES.items()))
 
     naplo_index = {}
     try:
@@ -601,6 +722,7 @@ def frissites():
         "kiertekelt": sum(1 for p in projektek if p["allapot"] == "kiértékelt"),
         "nincs_kalkulacio": sum(1 for p in projektek if p["allapot"] == "nincs kalkuláció"),
         "anyagszallitok": AKTIV_ANYAG_LISTA,
+        "nevmegfeleltetes": AKTIV_NEVMEGFELELTETES,
     }
 
 
