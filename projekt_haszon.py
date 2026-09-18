@@ -113,8 +113,13 @@ def anyag_szallito_e(partner_nev, lista=None):
 # ---------------------------------------------------------------- 1. kimenő → BID (Innonest /invoices)
 
 def _acquisition_page_url(offset):
-    """Beszerzési lista lapozási URL-je, a számlalistával azonos mintára."""
-    return f"https://app.innonest.hu/acquisition/index/{offset}/"
+    """Beszerzési lista lapozási URL-je.
+
+    Az Innonest listák két mintát használnak: a /invoices "/index/{offset}/",
+    a /ordersheets viszont "/index/{offset}/all". Az élő próbán (2026-09-18) a
+    perjeles változat MINDIG az első oldalt adta vissza, ezért itt az /all-os
+    mintát használjuk, a /ordersheets-hez hasonlóan."""
+    return f"https://app.innonest.hu/acquisition/index/{offset}/all"
 
 
 def kimeno_bid_kinyeres(innonest_szamla_sorok):
@@ -370,6 +375,9 @@ async def _innonest_gyujtes_async(kezdo_bidek):
             oldal_sorok = await _get_beszerzesi_sorok(page)
             ujak = [x for x in oldal_sorok if x.get("azonosito") and x["azonosito"] not in latott]
             if not ujak:
+                if oldal == 1 and len(oldal_sorok) >= LISTA_OLDALMERET:
+                    log.warning("[HASZON] A beszerzési lista 2. oldala ugyanazt adta vissza — "
+                                "a lapozási URL-minta rossz, csak az első %d sort látjuk!", len(lista))
                 break
             latott.update(x["azonosito"] for x in ujak)
             lista.extend(ujak)
@@ -543,9 +551,34 @@ async def _diag_innonest_async(bid):
                 break
             offset += LISTA_OLDALMERET
 
+        # Melyik lapozási URL-minta működik? Mindkettőt kipróbáljuk a 2. oldalon.
+        ki["lapozas_proba"] = {}
+        mintak = {"/index/{o}/all": "https://app.innonest.hu/acquisition/index/{o}/all",
+                  "/index/{o}/": "https://app.innonest.hu/acquisition/index/{o}/",
+                  "?page=N": "https://app.innonest.hu/acquisition?page={p}"}
+        elso_azonositok = None
+        mukodo = None
+        for nev, sablon in mintak.items():
+            try:
+                await page.goto(sablon.format(o=0, p=1), wait_until="networkidle")
+                await page.wait_for_timeout(700)
+                a = {x["azonosito"] for x in await _get_beszerzesi_sorok(page)}
+                await page.goto(sablon.format(o=LISTA_OLDALMERET, p=2), wait_until="networkidle")
+                await page.wait_for_timeout(700)
+                b = {x["azonosito"] for x in await _get_beszerzesi_sorok(page)}
+                ki["lapozas_proba"][nev] = {"1_oldal_sor": len(a), "2_oldal_sor": len(b),
+                                            "atfedes": len(a & b), "uj_a_2_oldalon": len(b - a)}
+                if b - a and not mukodo:
+                    mukodo = sablon
+                elso_azonositok = elso_azonositok or a
+            except Exception as e:  # noqa: BLE001
+                ki["lapozas_proba"][nev] = {"hiba": str(e)[:150]}
+        ki["mukodo_lapozas"] = mukodo or "EGYIK SEM — a lista nem lapozható ezekkel az URL-ekkel"
+
         lista, latott = [], set()
+        sablon = mukodo or mintak["/index/{o}/all"]
         for oldal in range(30):
-            await page.goto(_acquisition_page_url(oldal * LISTA_OLDALMERET), wait_until="networkidle")
+            await page.goto(sablon.format(o=oldal * LISTA_OLDALMERET, p=oldal + 1), wait_until="networkidle")
             await page.wait_for_timeout(800)
             oldal_sorok = await _get_beszerzesi_sorok(page)
             ujak = [x for x in oldal_sorok if x.get("azonosito") and x["azonosito"] not in latott]
@@ -557,6 +590,7 @@ async def _diag_innonest_async(bid):
                 break
         ki["acquisition_oldalak"] = oldal + 1
         ki["acquisition_osszes_sor"] = len(lista)
+        ki["acquisition_bid_lista"] = sorted({x["bid"] for x in lista if x.get("bid")})[:200]
         ki["acquisition_bid_talalatok"] = sum(1 for s in lista if s.get("bid"))
         for s in lista:
             if s.get("bid") != bid:
@@ -613,6 +647,69 @@ def _fs_dok(d):
     return {k: _fs_ertek(v) for k, v in (d.get("fields") or {}).items()}
 
 
+def _fs_kereses(obj, keresett=("bid",), ut=""):
+    """Rekurzívan megkeresi, HOL van a kulcs a dokumentumban. [(útvonal, érték)]"""
+    talalt = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            uj = f"{ut}.{k}" if ut else k
+            if any(x.lower() == k.lower() for x in keresett):
+                talalt.append((uj, v if not isinstance(v, (dict, list)) else str(v)[:300]))
+            talalt.extend(_fs_kereses(v, keresett, uj))
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj[:20]):
+            talalt.extend(_fs_kereses(v, keresett, f"{ut}[{i}]"))
+    return talalt
+
+
+def _fs_szerkezet(obj, ut="", melyseg=0, max_melyseg=4):
+    """A dokumentum szerkezete: útvonal → típus és rövid értékminta."""
+    ki = {}
+    if melyseg > max_melyseg:
+        return {ut: "…(mélyebb szint)"}
+    if isinstance(obj, dict):
+        for k, v in list(obj.items())[:60]:
+            uj = f"{ut}.{k}" if ut else k
+            if isinstance(v, (dict, list)):
+                ki.update(_fs_szerkezet(v, uj, melyseg + 1, max_melyseg))
+            else:
+                ki[uj] = v if not isinstance(v, str) else v[:150]
+    elif isinstance(obj, list):
+        ki[f"{ut}[]"] = f"{len(obj)} elem"
+        if obj:
+            ki.update(_fs_szerkezet(obj[0], f"{ut}[0]", melyseg + 1, max_melyseg))
+    else:
+        ki[ut] = obj
+    return ki
+
+
+def _diag_projekt(projekt_id):
+    """Egy konkrét kalkulátor-projekt TELJES tartalma — ebből tudjuk meg, hol
+    vannak a kalkulált összegek és a saját csapat jelölés."""
+    ki = {"projekt_id": projekt_id}
+    try:
+        fejlec = {"Authorization": "Bearer " + sk.access_token()}
+        r = requests.get(_firestore_ut(f"/projects/{projekt_id}"), headers=fejlec, timeout=30)
+        if r.status_code >= 400:
+            ki["hiba"] = f"Firestore {r.status_code}: {r.text[:300]}"
+            return ki
+        adat = _fs_dok(r.json())
+        ki["felso_szintu_mezok"] = sorted(adat.keys())
+        ki["name"] = adat.get("name")
+        ki["bid_talalatok"] = [{"utvonal": u, "ertek": v} for u, v in
+                               _fs_kereses(adat, ("bid", "bidSzam", "bid_szam"))]
+        ki["meta"] = (adat.get("snap") or {}).get("meta")
+        ki["snap_szerkezet"] = _fs_szerkezet(adat.get("snap"), "snap")
+        # a pénzügyileg érdekes mezők: aminek a neve összegre utal
+        ki["osszegre_utalo_mezok"] = {u: v for u, v in ki["snap_szerkezet"].items()
+                                      if isinstance(v, (int, float)) and not isinstance(v, bool)
+                                      and abs(v or 0) >= 1000}
+        ki["logikai_mezok"] = {u: v for u, v in ki["snap_szerkezet"].items() if isinstance(v, bool)}
+    except Exception as e:  # noqa: BLE001
+        ki["hiba"] = f"{type(e).__name__}: {e}"
+    return ki
+
+
 def _diag_firestore(bid):
     """Felderíti a webapp Firestore-tárolását: milyen collectionök vannak, és
     melyikben található az adott BID — mezőnevekkel együtt."""
@@ -658,7 +755,8 @@ def _diag_firestore(bid):
                 info["bid_talalat"] = {"hol": "dokumentum-azonosító", "mezok": sorted(adat.keys()),
                                        "ertekek": {k: str(v)[:200] for k, v in adat.items()}}
             else:
-                for mezo in ("bid", "BID", "bidSzam", "bid_szam", "projektBid", "azonosito", "projectId"):
+                for mezo in ("snap.meta.bid", "meta.bid", "bid", "BID", "bidSzam",
+                             "bid_szam", "projektBid", "azonosito", "projectId"):
                     q = requests.post(_firestore_ut() + ":runQuery", headers=fejlec, timeout=30, json={
                         "structuredQuery": {
                             "from": [{"collectionId": nev}],
@@ -672,8 +770,9 @@ def _diag_firestore(bid):
                         adat = _fs_dok(tal[0])
                         info["bid_talalat"] = {"hol": f"mező: {mezo}",
                                                "doc_id": tal[0].get("name", "").rsplit("/", 1)[-1],
-                                               "mezok": sorted(adat.keys()),
-                                               "ertekek": {k: str(v)[:200] for k, v in adat.items()}}
+                                               "name": adat.get("name"),
+                                               "meta": (adat.get("snap") or {}).get("meta"),
+                                               "mezok": sorted(adat.keys())}
                         break
             ki["collectionok"].append(info)
     except Exception as e:  # noqa: BLE001
@@ -687,7 +786,6 @@ def _diag_szamlak(bid):
     forras = os.environ.get("SZAMLAZZ_SHEET_ID")
     szamlak = _sorok_dict(sk.olvas("'Számlák'!A1:AG", forras))
     tetelek = _sorok_dict(sk.olvas("'Tételek'!A1:P", forras))
-    kiv_index = kiv_index or {}
     tetel_index = defaultdict(list)
     for t in tetelek:
         tetel_index[(t.get("irany"), str(t.get("szamlazz_id")))].append(t)
@@ -716,9 +814,12 @@ def _diag_szamlak(bid):
                           "csökkenő nettó szerint — ezek a jelöltek a kézi hozzárendeléshez."}
 
 
-def diagnosztika(bid):
+def diagnosztika(bid, projekt_id=None):
     from innonest_core import run_in_loop
     ki = {"bid": bid, "sheet": {}, "innonest": {}, "firestore": {}}
+    if projekt_id:
+        # Csak a projekt-dump kell — ez gyors, nem indít böngészőt.
+        return {"projekt": _diag_projekt(projekt_id)}
     try:
         ki["sheet"] = _diag_szamlak(bid)
     except Exception as e:  # noqa: BLE001
@@ -751,10 +852,13 @@ def register_projekt_haszon_routes(app):
         titok = os.environ.get("SZAMLAZZ_HASZON_SECRET", "")
         if not titok or request.args.get("secret") != titok:
             return jsonify({"ok": False, "error": "unauthorized"}), 401
+        projekt_id = (request.args.get("projekt") or "").strip()
+        if projekt_id:
+            return jsonify({"ok": True, **diagnosztika("", projekt_id)})
         bid = bid_normalizal(request.args.get("bid", ""))
         if not bid:
-            return jsonify({"ok": False, "error": "hiányzó vagy hibás bid paraméter "
-                                                  "(pl. ?bid=BID-2026-259)"}), 400
+            return jsonify({"ok": False, "error": "hiányzó vagy hibás paraméter — "
+                                                  "?bid=BID-2026-259 vagy ?projekt=mu6rw7nzoi6d"}), 400
         try:
             return jsonify({"ok": True, **diagnosztika(bid)})
         except Exception as e:  # noqa: BLE001
