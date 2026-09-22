@@ -69,8 +69,11 @@ def _gmail(ut, params=None):
             time.sleep(1.5 * (probalkozas + 1))
             continue
         if r.status_code == 403:
-            raise RuntimeError("Gmail 403 — a refresh tokenhez hiányzik a gmail.readonly jogosultság. "
-                               "Futtasd újra az oauth_token_szerzo.py-t.")
+            reszlet = r.text[:200].replace("\n", " ")
+            if "has not been used" in r.text or "disabled" in r.text:
+                raise RuntimeError(f"Gmail API nincs engedélyezve a Google Cloud projektben: {reszlet}")
+            raise RuntimeError(f"Gmail 403 — valószínűleg hiányzik a gmail.readonly hatókör a refresh "
+                               f"tokenből (futtasd újra az oauth_token_szerzo.py-t). Google válasza: {reszlet}")
         if r.status_code >= 400:
             raise RuntimeError(f"Gmail {r.status_code}: {r.text[:200]}")
         return r.json()
