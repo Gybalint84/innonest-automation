@@ -49,8 +49,17 @@ KIV_RE = re.compile(r"KIV\s*#\s?(\d{4}-\d+)", re.IGNORECASE)   # megrendelőlap-
 INVOICE_REF_RE = re.compile(r"#(BID-)?(\d{4}-\d+)")     # ugyanaz, mint innonest_szamlalo.INVOICE_REF_PATTERN
 
 PROJEKT_LAP = "Projektek"
-HOZZAR_LAP = "Hozzárendelések"
+HOZZAR_LAP = "Hozzárendelések"          # régi lap — már nem írjuk, a két BID-lap váltotta
+KIMENO_LAP = "Kimenő BID"
+BEJOVO_LAP = "Bejövő BID"
 BEALL_LAP = "Beállítások"
+
+KIMENO_OSZLOPOK = ["szamlaszam", "kelt", "ugyfel", "tipus", "netto_huf",
+                   "bid_auto", "forras", "bid_kezi", "bid"]
+BEJOVO_OSZLOPOK = ["szamlaszam", "kelt", "partner", "kategoria", "netto_huf",
+                   "bid_auto", "forras", "gmail_allapot", "bid_kezi", "bid", "figyelmeztetes"]
+
+GMAIL_MAX_PER_FUTAS = int(os.environ.get("SZAMLAZZ_GMAIL_MAX", "40"))
 NAPLO_ALAP_ID = "1XQO7-kq2dtPhMpZ5ew327vVq-ddW1IFSAReaVLAQQs0"
 
 PROJEKT_OSZLOPOK = [
@@ -93,22 +102,54 @@ def _sorok_dict(sorok, oszlopok=None):
 
 
 ANYAG_ALAP = ["STO", "Murexin", "MC Bauchemie", "Conica", "Eurostep"]
+ALV_ALAP = ["V-Clean&Services Kft", "Kotán Építéstechnológia Kft.", "CHEMI BAU PLUSZ Kft.",
+            "CSEH ÉS TÁRSA ÉPÍTŐ Kft.", "Epoxy Padló Kft.", "Padló Service Kft.",
+            "Padlótechnika-Melegburkolati Kft.", "Fodor EP Floor Kft."]
 
-# A Beállítások lapról beolvasott lista; amíg None, az alapértelmezés érvényes.
+# A Beállítások lapról beolvasott listák; amíg None, az alapértelmezés érvényes.
 AKTIV_ANYAG_LISTA = None
+AKTIV_ALV_LISTA = None
+
+# A cégforma nem azonosít: "Kft." és "Korlátolt Felelősségű Társaság" ugyanaz.
+_CEGFORMA = {"kft", "zrt", "nyrt", "bt", "kkt", "rt", "korlatolt", "felelossegu", "tarsasag",
+             "reszvenytarsasag", "betéti", "beteti", "ag", "gmbh", "ltd", "sro"}
+
+
+def _tokenek(nev):
+    """Ékezet- és írásjel-független szótokenek, cégforma nélkül.
+    'Sto Épitöanyag Kft.' → {'sto', 'epitoanyag'}"""
+    import unicodedata
+    s = unicodedata.normalize("NFKD", str(nev or "")).encode("ascii", "ignore").decode().lower()
+    return {t for t in re.split(r"[^a-z0-9]+", s) if t and t not in _CEGFORMA}
+
+
+def ceg_egyezik(lista_nev, partner_nev):
+    """Illeszkedik-e egy listában megadott cégnév a számla partnerére: a lista nevének
+    minden szava szerepel a partner nevében, egész szóként.
+    STO → 'Sto Épitöanyag Kft.' igen, de 'Deli Store Kft.' nem (a 'store' nem 'sto')."""
+    lt, pt = _tokenek(lista_nev), _tokenek(partner_nev)
+    return bool(lt) and lt <= pt
 
 
 def anyag_szallito_e(partner_nev, lista=None):
-    """Anyagbeszállító-e a partner. SZÓHATÁRRAL illesztünk, nem részstringgel:
-    a sima 'in' a "Deli Store"-t is STO-nak vette (élő próbán bukott ki 2026-09-11)."""
     if lista is None:
         lista = AKTIV_ANYAG_LISTA if AKTIV_ANYAG_LISTA is not None else ANYAG_ALAP
-    p = partner_nev or ""
-    for k in lista:
-        k = (k or "").strip()
-        if k and re.search(r"(?<![\wáéíóöőúüű])" + re.escape(k) + r"(?![\wáéíóöőúüű])", p, re.IGNORECASE):
-            return True
-    return False
+    return any(ceg_egyezik(n, partner_nev) for n in lista if n)
+
+
+def alvallalkozo_e(partner_nev, lista=None):
+    if lista is None:
+        lista = AKTIV_ALV_LISTA if AKTIV_ALV_LISTA is not None else ALV_ALAP
+    return any(ceg_egyezik(n, partner_nev) for n in lista if n)
+
+
+def partner_kategoria(partner_nev):
+    """'anyag' / 'alvállalkozó' / '' (nem figyelt partner — kimarad a kimutatásból)."""
+    if anyag_szallito_e(partner_nev):
+        return "anyag"
+    if alvallalkozo_e(partner_nev):
+        return "alvállalkozó"
+    return ""
 
 
 # ---------------------------------------------------------------- 1. kimenő → BID (Innonest /invoices)
@@ -211,7 +252,7 @@ def kimeno_bid_kinyeres(innonest_szamla_sorok):
 
 # ---------------------------------------------------------------- 2. bejövő → BID
 
-def bejovo_bid_hozzarendeles(rekord, tetelek, beszerzesek, naplo_index, kiv_index=None):
+def bejovo_bid_hozzarendeles(rekord, tetelek, beszerzesek, naplo_index, kiv_index=None, gmail=None):
     """
     Egy bejövő számla → (bid, módszer). beszerzesek: [{bid, beszallito, netto}] az Innonest-ből,
     naplo_index: {számlaszám: bid} az ellenőrző naplójából.
@@ -253,6 +294,11 @@ def bejovo_bid_hozzarendeles(rekord, tetelek, beszerzesek, naplo_index, kiv_inde
     b = naplo_index.get((rekord.get("szamlaszam") or "").strip())
     if b:
         return b, "ellenőrző napló"
+
+    # d) Gmail: a számla PDF-je vagy linkje (bid_kereso.py; az eredmény a Bejövő BID lapon marad)
+    g = (gmail or {}).get((rekord.get("szamlaszam") or "").strip())
+    if g and g[0]:
+        return g[0], "Gmail " + ("PDF" if "PDF" in (g[1] or "") else "link")
 
     return "", ""
 
@@ -316,12 +362,8 @@ def szamlazo_nev(kalk_nev, megfeleltetes=None):
 
 
 def nev_egyezik(kalk_nev, partner_nev, megfeleltetes=None):
-    """Illeszkedik-e a kalkulátorbeli név a számla partnernevére."""
-    keresett = _nev_kulcs(szamlazo_nev(kalk_nev, megfeleltetes))
-    partner = _nev_kulcs(partner_nev)
-    if not keresett or not partner:
-        return False
-    return keresett in partner or partner in keresett
+    """Illeszkedik-e a kalkulátorbeli név a számla partnernevére (Roliék → V-Clean)."""
+    return ceg_egyezik(szamlazo_nev(kalk_nev, megfeleltetes), partner_nev)
 
 
 def _totals_tetelek(totals, kulcs):
@@ -460,13 +502,39 @@ def _beszallitonkenti_elteres(kalk_tetelek, tenyleges):
     return " | ".join(sorok)
 
 
-def kimutatas_osszeallitas(szamlak, tetelek, kimeno_bid, beszerzesek, naplo_index, kezi, kiv_index=None):
+def duplikatum_jelzes(hozzar):
+    """Ugyanarra a BID-re, ugyanattól a partnertől, ugyanakkora összeggel több számla —
+    tipikusan elrontott és újrakiállított számla, aminek a sztornója nem érkezett meg.
+    A sztornó (negatív, azonos abszolút összegű) kioltja az egyik pozitívat."""
+    csoport = defaultdict(list)
+    for h in hozzar:
+        if h["irany"] != "Bejövő" or not h["bid_ervenyes"]:
+            continue
+        kulcs = (h["bid_ervenyes"], frozenset(_tokenek(h["partner_nev"])), round(abs(h["netto_huf"])))
+        csoport[kulcs].append(h)
+    for (bid, _, osszeg), tagok in csoport.items():
+        pozitiv = [t for t in tagok if t["netto_huf"] > 0]
+        negativ = [t for t in tagok if t["netto_huf"] < 0]
+        if len(pozitiv) - len(negativ) > 1:
+            szamok = ", ".join(t["szamlaszam"] for t in pozitiv)
+            for t in pozitiv:
+                t["figyelmeztetes"] = (f"{len(pozitiv)} db azonos összegű számla ({szamok}) erre a BID-re "
+                                       f"— hiányzó sztornó? A költség többszörösen számolódhat.")
+
+
+def kimutatas_osszeallitas(szamlak, tetelek, kimeno_bid, beszerzesek, naplo_index, kezi,
+                           kiv_index=None, gmail=None):
     """
     szamlak, tetelek: a Számlázz.hu-Sheet sorai dict-ként.
     kimeno_bid: {számlaszám: bid} az Innonest-ből. kezi: {számlaszám: (bid_kezi, kategoria_kezi)}.
-    Visszaad: (projekt_sorok, hozzarendeles_sorok) — mindkettő [dict] a fenti oszlopokkal.
+    gmail: {számlaszám: (bid, állapot)} — a Gmailből korábban vagy most kiolvasott BID-ek.
+    Visszaad: (projekt_sorok, hozzarendeles_sorok).
+
+    Bejövő számla CSAK akkor kerül be, ha a partnere szerepel a Beállítások lap
+    anyagbeszállító- vagy alvállalkozó-listáján — minden más (eMAG, Telekom, lízing) kimarad.
     """
     kiv_index = kiv_index or {}
+    gmail = gmail or {}
     tetel_index = defaultdict(list)
     for t in tetelek:
         tetel_index[(t.get("irany"), str(t.get("szamlazz_id")))].append(t)
@@ -484,21 +552,20 @@ def kimutatas_osszeallitas(szamlak, tetelek, kimeno_bid, beszerzesek, naplo_inde
         if tipus == "Sztornó számla":
             netto = -abs(netto)
 
+        bid_kezi, kat_kezi = kezi.get(szam, ("", ""))
         if irany == "Kimenő":
             bid_auto = kimeno_bid.get(szam, "")
             modszer = "Innonest számlalista" if bid_auto else ""
             kat_auto = "bevétel"
         else:
+            kat_auto = partner_kategoria(r.get("partner_nev"))
+            if not kat_auto and not kat_kezi:
+                continue          # nem figyelt partner — nem anyag, nem alvállalkozó
             bid_auto, modszer = bejovo_bid_hozzarendeles(
-                r, tetel_index[(irany, str(r.get("szamlazz_id")))], beszerzesek, naplo_index, kiv_index)
-            kat_auto = ""      # a BID ismeretében állítjuk be lentebb
+                r, tetel_index[(irany, str(r.get("szamlazz_id")))], beszerzesek, naplo_index,
+                kiv_index, gmail)
 
-        bid_kezi, kat_kezi = kezi.get(szam, ("", ""))
         bid_erv = bid_kezi or bid_auto
-        if irany == "Bejövő":
-            # Kategóriát csak akkor adunk, ha a számla projekthez köthető (akár kézzel) — különben
-            # "egyéb" (rezsi, irodaszer, lízing), ami nem kerül be egyetlen projekt költségébe sem.
-            kat_auto = ("anyag" if anyag_szallito_e(r.get("partner_nev")) else "munkadíj") if bid_erv else "egyéb"
         kat_erv = kat_kezi or kat_auto
         hozzar.append({
             "szamlaszam": szam, "irany": irany, "tipus": tipus, "kelt": r.get("kelt", ""),
@@ -506,7 +573,11 @@ def kimutatas_osszeallitas(szamlak, tetelek, kimeno_bid, beszerzesek, naplo_inde
             "bid_auto": bid_auto, "modszer": modszer, "kategoria_auto": kat_auto,
             "bid_kezi": bid_kezi, "kategoria_kezi": kat_kezi,
             "bid_ervenyes": bid_erv, "kategoria_ervenyes": kat_erv,
+            "gmail_allapot": (gmail.get(szam) or ("", ""))[1] if irany == "Bejövő" else "",
+            "figyelmeztetes": "",
         })
+
+    duplikatum_jelzes(hozzar)
 
     # projektenkénti összegzés
     proj = defaultdict(lambda: {"vegszamlak": [], "elolegszamlak": [], "bevetel": 0.0, "anyag": 0.0,
@@ -520,8 +591,10 @@ def kimutatas_osszeallitas(szamlak, tetelek, kimeno_bid, beszerzesek, naplo_inde
             p["bevetel"] += h["netto_huf"]
             p["ugyfel"] = p["ugyfel"] or h["partner_nev"]
             (p["elolegszamlak"] if h["tipus"] == "Előlegszámla" else p["vegszamlak"]).append(h["szamlaszam"])
-        elif h["kategoria_ervenyes"] in ("anyag", "munkadíj"):
+        elif h["kategoria_ervenyes"] in ("anyag", "alvállalkozó", "munkadíj"):
             mezo = "anyag" if h["kategoria_ervenyes"] == "anyag" else "munkadij"
+            if h.get("figyelmeztetes"):
+                p.setdefault("figyelmeztetesek", []).append(f"{h['szamlaszam']}: {h['figyelmeztetes']}")
             p[mezo] += h["netto_huf"]
             reszletek = p["anyag_partner" if mezo == "anyag" else "alv_partner"]
             nev = h["partner_nev"] or "(névtelen)"
@@ -572,6 +645,9 @@ def kimutatas_osszeallitas(szamlak, tetelek, kimeno_bid, beszerzesek, naplo_inde
         if p["anyag"] == 0 and p["munkadij"] == 0 and p["vegszamlak"]:
             sor["megjegyzes"] = (sor["megjegyzes"] + " | " if sor["megjegyzes"] else "") + \
                 "nincs hozzárendelt költség"
+        if p.get("figyelmeztetesek"):
+            sor["megjegyzes"] = (sor["megjegyzes"] + " | " if sor["megjegyzes"] else "") + \
+                "FIGYELEM — " + "; ".join(sorted(set(p["figyelmeztetesek"])))
         projektek.append(sor)
 
     return projektek, hozzar
@@ -672,91 +748,132 @@ def _cel_id():
     return sid
 
 
-def anyagszallitok_olvasas():
-    """Az anyagbeszállítók listája a Beállítások lapról. Ha a lap még nincs meg,
-    létrehozza az alapértelmezett listával — onnantól a Sheetben szerkeszthető,
-    nem kell hozzá Railway-deploy."""
+def beallitasok_olvasas():
+    """A Beállítások lap: anyagbeszállítók, alvállalkozók, névmegfeleltetés.
+
+    Sorok:  A="Anyagbeszállító",  B=cégnév (ahogy a számlán szerepel)
+            A="Alvállalkozó",     B=cégnév
+            A="Névmegfeleltetés", B=kalkulátorbeli név, C=a számlán szereplő név
+    Ha a lap nincs meg, létrehozza; ha nincs rajta Alvállalkozó-sor, hozzáfűzi az
+    alapértelmezett listát, hogy legyen mit szerkeszteni."""
     cel = _cel_id()
     if BEALL_LAP not in sk.lapok(cel):
         sk.lap_letrehozas(BEALL_LAP, ["beallitas", "ertek", "leiras"], sheet_id=cel)
-        sorok = [["Anyagbeszállító", n, "Ezek bejövő számlái számítanak ANYAGKÖLTSÉGNEK. "
-                  "Új beszállító: új sor, A oszlop = Anyagbeszállító. Minden más partner = munkadíj."]
-                 for n in ANYAG_ALAP]
-        sorok += [["Névmegfeleltetés", k, v] for k, v in NEVMEGFELELTETES_ALAP.items()]
-        sorok.append(["Névmegfeleltetés", "", ""])
-        sorok.append(["", "", "Névmegfeleltetés: B = a kalkulátorban használt név (pl. Roliék), "
-                              "C = a számlán szereplő cégnév részlete (pl. V-Clean)."])
-        sk.ir(f"'{BEALL_LAP}'!A2", sorok, sheet_id=cel)
-        log.info("[HASZON] Beállítások lap létrehozva az alapértelmezett beszállítókkal")
-        return list(ANYAG_ALAP)
+        sk.ir(f"'{BEALL_LAP}'!A2", [["", "", "Anyagbeszállító / Alvállalkozó: B = a cégnév, ahogy a számlán "
+                                              "szerepel. Csak ezek bejövő számlái kerülnek a kimutatásba."]],
+              sheet_id=cel)
+    sorok = sk.olvas(f"'{BEALL_LAP}'!A2:C", cel)
 
-    lista = []
-    for sor in sk.olvas(f"'{BEALL_LAP}'!A2:B", cel):
-        if len(sor) >= 2 and str(sor[0]).strip().lower().startswith("anyagbeszáll") and str(sor[1]).strip():
-            lista.append(str(sor[1]).strip())
-    if not lista:
-        log.warning("[HASZON] A Beállítások lapon nincs egyetlen anyagbeszállító sem — az alapértelmezést használom")
-        return list(ANYAG_ALAP)
-    return lista
+    def gyujt(elotag):
+        return [str(r[1]).strip() for r in sorok
+                if len(r) >= 2 and str(r[0]).strip().lower().startswith(elotag) and str(r[1]).strip()]
+
+    anyag, alv = gyujt("anyagbeszáll"), gyujt("alvállalkoz")
+    megf = {_nev_kulcs(r[1]): str(r[2]).strip() for r in sorok
+            if len(r) >= 3 and str(r[0]).strip().lower().startswith("névmegfeleltet")
+            and str(r[1]).strip() and str(r[2]).strip()}
+
+    potlas = []
+    if not anyag:
+        potlas += [["Anyagbeszállító", n, ""] for n in ANYAG_ALAP]
+        anyag = list(ANYAG_ALAP)
+    if not alv:
+        potlas += [["Alvállalkozó", n, "alapértelmezés — ellenőrizd, egészítsd ki"] for n in ALV_ALAP]
+        alv = list(ALV_ALAP)
+    if not megf:
+        potlas += [["Névmegfeleltetés", k, v] for k, v in NEVMEGFELELTETES_ALAP.items()]
+        megf = dict(NEVMEGFELELTETES_ALAP)
+    if potlas:
+        sk.hozzafuz(f"'{BEALL_LAP}'!A1", potlas, sheet_id=cel)
+        log.info("[HASZON] Beállítások lap kiegészítve %d alapértelmezett sorral", len(potlas))
+    return anyag, alv, megf
 
 
-def nevmegfeleltetes_olvasas():
-    """Kalkulátorbeli név → számlán szereplő névrészlet, a Beállítások lapról.
-    Sor: A="Névmegfeleltetés", B=kalkulátorbeli név, C=a számlán keresendő névrészlet."""
+def _lap_sorai(nev):
     cel = _cel_id()
-    if BEALL_LAP not in sk.lapok(cel):
-        return dict(NEVMEGFELELTETES_ALAP)
-    ki = {}
-    for sor in sk.olvas(f"'{BEALL_LAP}'!A2:C", cel):
-        if len(sor) >= 3 and str(sor[0]).strip().lower().startswith("névmegfeleltet") \
-                and str(sor[1]).strip() and str(sor[2]).strip():
-            ki[_nev_kulcs(sor[1])] = str(sor[2]).strip()
-    return ki or dict(NEVMEGFELELTETES_ALAP)
+    if nev not in sk.lapok(cel):
+        return []
+    return _sorok_dict(sk.olvas(f"'{nev}'!A1:Z", cel))
 
 
-def kezi_felulirasok_olvasas():
-    """A Hozzárendelések lap kézi oszlopai — ezek túlélik a frissítést."""
-    cel = _cel_id()
-    if HOZZAR_LAP not in sk.lapok(cel):
-        return {}
-    d = _sorok_dict(sk.olvas(f"'{HOZZAR_LAP}'!A1:M", cel))
-    return {str(s.get("szamlaszam", "")).strip(): (bid_normalizal(s.get("bid_kezi", "")), str(s.get("kategoria_kezi", "")).strip())
-            for s in d if s.get("bid_kezi") or s.get("kategoria_kezi")}
+def korabbi_allapot_olvasas():
+    """A két BID-lap korábbi tartalma: a kézi javítások és a Gmail-keresések eredménye.
+    Ezek túlélik a frissítést — a Gmailt nem kell újra végigkeresni."""
+    kezi, gmail = {}, {}
+    for sor in _lap_sorai(KIMENO_LAP) + _lap_sorai(BEJOVO_LAP):
+        szam = str(sor.get("szamlaszam", "")).strip()
+        if not szam:
+            continue
+        b = bid_normalizal(sor.get("bid_kezi", ""))
+        if b:
+            kezi[szam] = (b, "")
+        allapot = str(sor.get("gmail_allapot", "")).strip()
+        # a "hiba" állapotúakat újrapróbáljuk, a többit nem
+        if allapot and not allapot.startswith("hiba"):
+            gmail[szam] = (bid_normalizal(sor.get("bid_auto", "")) if "talált" in allapot else "", allapot)
+    # a régi Hozzárendelések lap kézi BID-jei is éljenek tovább, ha még nem írtad át
+    for sor in _lap_sorai(HOZZAR_LAP):
+        szam = str(sor.get("szamlaszam", "")).strip()
+        b = bid_normalizal(sor.get("bid_kezi", ""))
+        if szam and b and szam not in kezi:
+            kezi[szam] = (b, str(sor.get("kategoria_kezi", "")).strip())
+    return kezi, gmail
 
 
 VEDETT_LAPOK = {"Számlák", "Tételek", "Napló"}
 
 
-def kimutatas_iras(projektek, hozzar):
+def _lapot_ir(nev, oszlopok, sorok):
     cel = _cel_id()
-    if VEDETT_LAPOK & {PROJEKT_LAP, HOZZAR_LAP, BEALL_LAP}:      # biztosíték átnevezés ellen
-        raise RuntimeError("A kimutatás lapneve ütközik a Számlázz.hu adatkapcsolat lapjaival")
-    meglevo = sk.lapok(cel)
-    for nev, fej in ((PROJEKT_LAP, PROJEKT_OSZLOPOK), (HOZZAR_LAP, HOZZAR_OSZLOPOK)):
-        if nev not in meglevo:
-            sk.lap_letrehozas(nev, fej, sheet_id=cel)
-    sk.torol(f"'{PROJEKT_LAP}'!A2:Z", cel)
-    sk.torol(f"'{HOZZAR_LAP}'!A2:Z", cel)
-    if projektek:
-        sk.ir(f"'{PROJEKT_LAP}'!A2", [[p.get(k, "") for k in PROJEKT_OSZLOPOK] for p in projektek], sheet_id=cel)
-    if hozzar:
-        sk.ir(f"'{HOZZAR_LAP}'!A2", [[h.get(k, "") for k in HOZZAR_OSZLOPOK] for h in hozzar], sheet_id=cel)
+    if nev in VEDETT_LAPOK:
+        raise RuntimeError(f"A(z) {nev} lapot a Számlázz.hu adatkapcsolat használja — nem írom felül")
+    if nev not in sk.lapok(cel):
+        sk.lap_letrehozas(nev, oszlopok, sheet_id=cel)
+    sk.torol(f"'{nev}'!A2:Z", cel)
+    if sorok:
+        sk.ir(f"'{nev}'!A2", [[r.get(k, "") for k in oszlopok] for r in sorok], sheet_id=cel)
+
+
+def bid_lapok(hozzar):
+    """A belső hozzárendelés-sorokból a két lap sorai."""
+    kimeno = [{"szamlaszam": h["szamlaszam"], "kelt": h["kelt"], "ugyfel": h["partner_nev"],
+               "tipus": h["tipus"], "netto_huf": h["netto_huf"], "bid_auto": h["bid_auto"],
+               "forras": h["modszer"], "bid_kezi": h["bid_kezi"], "bid": h["bid_ervenyes"]}
+              for h in hozzar if h["irany"] == "Kimenő"]
+    bejovo = [{"szamlaszam": h["szamlaszam"], "kelt": h["kelt"], "partner": h["partner_nev"],
+               "kategoria": h["kategoria_ervenyes"], "netto_huf": h["netto_huf"],
+               "bid_auto": h["bid_auto"], "forras": h["modszer"],
+               "gmail_allapot": h.get("gmail_allapot", ""), "bid_kezi": h["bid_kezi"],
+               "bid": h["bid_ervenyes"], "figyelmeztetes": h.get("figyelmeztetes", "")}
+              for h in hozzar if h["irany"] == "Bejövő"]
+    kimeno.sort(key=lambda x: str(x["kelt"]), reverse=True)
+    bejovo.sort(key=lambda x: str(x["kelt"]), reverse=True)
+    return kimeno, bejovo
+
+
+def gmail_jeloltek(hozzar, gmail_cache):
+    """Azok a bejövő számlák, amikhez a Gmailben kell keresni: nincs BID-jük semmilyen
+    más forrásból, nincs kézi BID, és még nem kerestük őket (vagy hibára futottak).
+    A legfrissebbek elöl — így a folyamatban lévő projektek előbb teljesednek ki."""
+    ki = [h for h in hozzar
+          if h["irany"] == "Bejövő" and not h["bid_ervenyes"] and h["szamlaszam"] not in gmail_cache]
+    ki.sort(key=lambda h: str(h["kelt"]), reverse=True)
+    return [h["szamlaszam"] for h in ki]
 
 
 def frissites():
     """Teljes futás. Visszaad egy összegzést a végpontnak."""
     from innonest_core import run_in_loop
+    import bid_kereso as bk
 
-    global AKTIV_ANYAG_LISTA, AKTIV_NEVMEGFELELTETES
+    global AKTIV_ANYAG_LISTA, AKTIV_ALV_LISTA, AKTIV_NEVMEGFELELTETES
     forras = os.environ.get("SZAMLAZZ_SHEET_ID")
     szamlak = _sorok_dict(sk.olvas("'Számlák'!A1:AG", forras))
     tetelek = _sorok_dict(sk.olvas("'Tételek'!A1:P", forras))
-    kezi = kezi_felulirasok_olvasas()
-    AKTIV_ANYAG_LISTA = anyagszallitok_olvasas()
-    AKTIV_NEVMEGFELELTETES = nevmegfeleltetes_olvasas()
-    log.info("[HASZON] Anyagbeszállítók: %s | névmegfeleltetés: %s",
-             ", ".join(AKTIV_ANYAG_LISTA),
-             ", ".join(f"{k}→{v}" for k, v in AKTIV_NEVMEGFELELTETES.items()))
+    AKTIV_ANYAG_LISTA, AKTIV_ALV_LISTA, AKTIV_NEVMEGFELELTETES = beallitasok_olvasas()
+    kezi, gmail_cache = korabbi_allapot_olvasas()
+    log.info("[HASZON] Anyagbeszállítók: %d, alvállalkozók: %d, kézi BID: %d, Gmail-gyorsítótár: %d",
+             len(AKTIV_ANYAG_LISTA), len(AKTIV_ALV_LISTA), len(kezi), len(gmail_cache))
 
     naplo_index = {}
     try:
@@ -766,32 +883,60 @@ def frissites():
     except Exception as e:  # noqa: BLE001 — a napló opcionális
         log.warning("[HASZON] Ellenőrző napló nem olvasható: %s", e)
 
-    # Innonest (egy böngésző-menet): kimenő számlák → BID, majd beszerzések az érdekes BID-ekhez.
-    # Kiinduló érdekes BID-ek: kézi hozzárendelések + a számlák szövegében talált BID-ek.
     kezdo_bidek = {b for b, _ in kezi.values() if b}
     for r in szamlak:
         b = bid_normalizal(r.get("megjegyzes", "") + " " + r.get("rendelesszam", ""))
         if b:
             kezdo_bidek.add(b)
-    szamla_sorok, beszerzesek, lapozas_gond = run_in_loop(_innonest_gyujtes_async(kezdo_bidek))
+    szamla_sorok, beszerzesek, figyelmeztetes = run_in_loop(_innonest_gyujtes_async(kezdo_bidek))
     kimeno_bid = kimeno_bid_kinyeres(szamla_sorok)
     kiv_index = {b["kiv"]: b["bid"] for b in beszerzesek if b.get("kiv") and b.get("bid")}
 
-    projektek, hozzar = kimutatas_osszeallitas(szamlak, tetelek, kimeno_bid, beszerzesek, naplo_index, kezi, kiv_index)
-    kimutatas_iras(projektek, hozzar)
+    # 1. kör: minden forrás a Gmail nélkül → kiderül, hol hiányzik még a BID
+    _, hozzar = kimutatas_osszeallitas(szamlak, tetelek, kimeno_bid, beszerzesek, naplo_index,
+                                       kezi, kiv_index, gmail_cache)
+    jeloltek = gmail_jeloltek(hozzar, gmail_cache)
 
+    # 2. Gmail-keresés a hiányzókra (korlátozott számban; a többi a következő futásra marad)
+    gmail = dict(gmail_cache)
+    gmail_uj = {}
+    if jeloltek:
+        try:
+            gmail_uj = run_in_loop(bk.bid_kereses_async(jeloltek, max_db=GMAIL_MAX_PER_FUTAS))
+        except Exception as e:  # noqa: BLE001
+            log.warning("[HASZON] Gmail-keresés nem sikerült: %s", e)
+            figyelmeztetes = (figyelmeztetes + " | " if figyelmeztetes else "") + f"Gmail-keresés hiba: {e}"
+        for szam, e in gmail_uj.items():
+            gmail[szam] = (e["bid"], e["allapot"])
+
+    # 3. kör: végleges összeállítás
+    projektek, hozzar = kimutatas_osszeallitas(szamlak, tetelek, kimeno_bid, beszerzesek, naplo_index,
+                                               kezi, kiv_index, gmail)
+    kimeno_sorok, bejovo_sorok = bid_lapok(hozzar)
+    _lapot_ir(KIMENO_LAP, KIMENO_OSZLOPOK, kimeno_sorok)
+    _lapot_ir(BEJOVO_LAP, BEJOVO_OSZLOPOK, bejovo_sorok)
+    _lapot_ir(PROJEKT_LAP, PROJEKT_OSZLOPOK, projektek)
+
+    hatravan = max(0, len(jeloltek) - GMAIL_MAX_PER_FUTAS)
     return {
-        "ok": True, "projektek": len(projektek), "szamlak": len(hozzar),
-        "kimeno_bid_talalat": len(kimeno_bid),
-        "bejovo_hozzarendelt": sum(1 for h in hozzar if h["irany"] == "Bejövő" and h["bid_ervenyes"]),
-        "bejovo_nincs_bid": sum(1 for h in hozzar if h["irany"] == "Bejövő" and not h["bid_ervenyes"]),
-        "kiertekelt": sum(1 for p in projektek if p["allapot"] == "kiértékelt"),
-        "nincs_kalkulacio": sum(1 for p in projektek if p["allapot"] == "nincs kalkuláció"),
+        "ok": True,
+        "kimeno_szamlak": len(kimeno_sorok),
+        "kimeno_bid_nelkul": sum(1 for r in kimeno_sorok if not r["bid"]),
+        "bejovo_szamlak": len(bejovo_sorok),
+        "bejovo_bid_nelkul": sum(1 for r in bejovo_sorok if not r["bid"]),
+        "gmail_most_keresve": len(gmail_uj),
+        "gmail_most_talalt": sum(1 for e in gmail_uj.values() if e["bid"]),
+        "gmail_hatravan": hatravan,
+        "duplikatum_gyanu": sum(1 for r in bejovo_sorok if r["figyelmeztetes"]),
+        "projektek": len(projektek),
+        "allapotok": {a: sum(1 for p in projektek if p["allapot"] == a)
+                      for a in sorted({p["allapot"] for p in projektek})},
         "anyagszallitok": AKTIV_ANYAG_LISTA,
-        "nevmegfeleltetes": AKTIV_NEVMEGFELELTETES,
-        "figyelmeztetes": lapozas_gond or "",
+        "alvallalkozok": AKTIV_ALV_LISTA,
+        "figyelmeztetes": (figyelmeztetes or "") +
+                          (f" | Még {hatravan} számla vár Gmail-keresésre — futtasd újra a frissítést."
+                           if hatravan else ""),
     }
-
 
 
 
@@ -1088,6 +1233,50 @@ def _diag_kalkulacio(bid):
     return ki
 
 
+def _diag_bidlista():
+    """Végigolvassa a projects collectiont, és kigyűjti, milyen BID-ek szerepelnek
+    a kalkulátorban. Ebből derül ki, hogy formátumkülönbség vagy hiányzó mentés
+    okozza-e a párosítás hiányát."""
+    ki = {"projektek": 0, "van_bid": 0, "nincs_bid": 0, "van_totals": 0}
+    bidek, mintak_bid_nelkul = {}, []
+    try:
+        fejlec = {"Authorization": "Bearer " + sk.access_token()}
+        token = None
+        for _ in range(40):
+            par = {"pageSize": 300}
+            if token:
+                par["pageToken"] = token
+            r = requests.get(_firestore_ut("/projects"), headers=fejlec, params=par, timeout=40)
+            if r.status_code >= 400:
+                ki["hiba"] = f"Firestore {r.status_code}: {r.text[:300]}"
+                break
+            adat = r.json()
+            for nyers in adat.get("documents", []):
+                d = _fs_dok(nyers)
+                snap = d.get("snap") or {}
+                meta = snap.get("meta") or {}
+                ki["projektek"] += 1
+                if snap.get("totals"):
+                    ki["van_totals"] += 1
+                b = str(meta.get("bid") or "").strip()
+                if b:
+                    ki["van_bid"] += 1
+                    bidek.setdefault(b, []).append(d.get("name") or "")
+                else:
+                    ki["nincs_bid"] += 1
+                    if len(mintak_bid_nelkul) < 15:
+                        mintak_bid_nelkul.append({"name": d.get("name"), "savedAt": d.get("savedAt")})
+            token = adat.get("nextPageToken")
+            if not token:
+                break
+    except Exception as e:  # noqa: BLE001
+        ki["hiba"] = f"{type(e).__name__}: {e}"
+    ki["bidek"] = sorted(bidek)
+    ki["tobbszor_szereplo_bidek"] = {b: len(v) for b, v in sorted(bidek.items()) if len(v) > 1}
+    ki["bid_nelkuli_minta"] = mintak_bid_nelkul
+    return ki
+
+
 def diagnosztika(bid, projekt_id=None):
     from innonest_core import run_in_loop
     ki = {"bid": bid, "sheet": {}, "innonest": {}, "firestore": {}}
@@ -1127,13 +1316,16 @@ def register_projekt_haszon_routes(app):
         titok = os.environ.get("SZAMLAZZ_HASZON_SECRET", "")
         if not titok or request.args.get("secret") != titok:
             return jsonify({"ok": False, "error": "unauthorized"}), 401
+        if request.args.get("bidlista"):
+            return jsonify({"ok": True, "bidlista": _diag_bidlista()})
         projekt_id = (request.args.get("projekt") or "").strip()
         if projekt_id:
             return jsonify({"ok": True, **diagnosztika("", projekt_id)})
         bid = bid_normalizal(request.args.get("bid", ""))
         if not bid:
             return jsonify({"ok": False, "error": "hiányzó vagy hibás paraméter — "
-                                                  "?bid=BID-2026-259 vagy ?projekt=mu6rw7nzoi6d"}), 400
+                                                  "?bid=BID-2026-259, ?projekt=mu6rw7nzoi6d "
+                                                  "vagy ?bidlista=1"}), 400
         try:
             return jsonify({"ok": True, **diagnosztika(bid)})
         except Exception as e:  # noqa: BLE001
