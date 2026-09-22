@@ -61,23 +61,44 @@ def _b64(adat):
 
 # ---------------------------------------------------------------- Gmail REST
 
+# A Gmail a forgalomkorlátozást is 403-mal jelzi, nem 429-cel. Ezeket újra kell próbálni;
+# csak a jogosultsági és az API-engedélyezési 403 a végleges hiba.
+KORLAT_JELEK = ("ratelimitexceeded", "userratelimitexceeded", "quotaexceeded",
+                "rate limit", "too many requests", "backenderror")
+
+
+def _403_tipusa(szoveg):
+    sz = (szoveg or "").lower()
+    if any(j in sz for j in KORLAT_JELEK):
+        return "korlat"
+    if "has not been used" in sz or "is disabled" in sz or "accessnotconfigured" in sz:
+        return "api_kikapcsolva"
+    return "jogosultsag"
+
+
 def _gmail(ut, params=None):
-    fejlec = {"Authorization": "Bearer " + sk.access_token()}
-    for probalkozas in range(4):
+    varakozas = 2.0
+    for probalkozas in range(5):
+        fejlec = {"Authorization": "Bearer " + sk.access_token()}
         r = requests.get(f"{GMAIL_API}{ut}", headers=fejlec, params=params, timeout=30)
         if r.status_code == 429 or r.status_code >= 500:
-            time.sleep(1.5 * (probalkozas + 1))
+            time.sleep(varakozas); varakozas *= 2
             continue
         if r.status_code == 403:
+            tipus = _403_tipusa(r.text)
             reszlet = r.text[:200].replace("\n", " ")
-            if "has not been used" in r.text or "disabled" in r.text:
+            if tipus == "korlat":
+                log.info("[BID-KERESO] Gmail forgalomkorlát — várok %.0f mp-et", varakozas)
+                time.sleep(varakozas); varakozas *= 2
+                continue
+            if tipus == "api_kikapcsolva":
                 raise RuntimeError(f"Gmail API nincs engedélyezve a Google Cloud projektben: {reszlet}")
-            raise RuntimeError(f"Gmail 403 — valószínűleg hiányzik a gmail.readonly hatókör a refresh "
-                               f"tokenből (futtasd újra az oauth_token_szerzo.py-t). Google válasza: {reszlet}")
+            raise RuntimeError(f"Gmail 403 — hiányzik a gmail.readonly hatókör a refresh tokenből "
+                               f"(futtasd újra az oauth_token_szerzo.py-t). Google válasza: {reszlet}")
         if r.status_code >= 400:
             raise RuntimeError(f"Gmail {r.status_code}: {r.text[:200]}")
         return r.json()
-    raise RuntimeError("Gmail: az újrapróbálások elfogytak")
+    raise RuntimeError("Gmail: az újrapróbálások elfogytak (tartós forgalomkorlát?)")
 
 
 def _reszek(payload):
@@ -238,7 +259,9 @@ async def bid_kereses_async(szamlaszamok, max_db=40):
     Legfeljebb max_db számlát néz meg egy futásban, hogy a HTTP-kérés ne fusson túl hosszan;
     a többit a következő frissítés folytatja (az eredmények a Bejövő BID lapon megmaradnak)."""
     eredmeny, linkesek = {}, []
-    for szam in szamlaszamok[:max_db]:
+    for i, szam in enumerate(szamlaszamok[:max_db]):
+        if i:
+            time.sleep(0.4)      # a Gmail percenkénti kéréskorlátja miatt
         try:
             u = szamla_levele(szam)
             if not u:
