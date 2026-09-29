@@ -13,10 +13,9 @@ Két mód:
                 (mennyiség, körülmények, rétegrend) cserélődnek
 
 A Claude API-t közvetlenül, `requests`-szel hívja (nem kell új Python-csomag).
-A rendszer-prompt az SQM árajánlat-tudásbázis (szoveg_tudasbazis.md, ennek a
-fájl mellett a sablonok/ mappában) — prompt cache-sel, így a ~15 ezer tokenes tudásbázis
-csak az első hívásnál számít teljes áron (5 percen belüli további hívásoknál
-a töredékéért).
+A rendszer-prompt: a jóváhagyott mintaszövegek (sablonok/szoveg_mintak.md,
+prompt cache-sel) + a webappban szerkeszthető stílusleírás (a kérés „stilus"
+mezője; tartalék: sablonok/szoveg_stilus.md).
 
 Környezeti változók (Railway → Variables):
   ANTHROPIC_API_KEY   – KÖTELEZŐ, a Claude API kulcs
@@ -24,7 +23,8 @@ Környezeti változók (Railway → Variables):
   API_KEY             – már létezik (server.py is ezt használja)
 
 Telepítés:
-  1. szoveg_ai.py a repó gyökerébe, sablonok/szoveg_tudasbazis.md a sablonok/ mappába
+  1. szoveg_ai.py a repó gyökerébe; a sablonok/ mappába: szoveg_mintak.md és
+     szoveg_stilus.md (a régi szoveg_tudasbazis.md törölhető)
   2. Dockerfile: a többi COPY sor mellé:   COPY szoveg_ai.py .
   3. server.py: a többi register_* hívás mellé:
        from szoveg_ai import register_szoveg_ai_routes
@@ -45,22 +45,36 @@ SZOVEG_AI_MODEL   = os.environ.get("SZOVEG_AI_MODEL", "claude-sonnet-5")
 API_KEY           = os.environ.get("API_KEY", "titkos-kulcs")
 _ANTHROPIC_URL    = "https://api.anthropic.com/v1/messages"
 
-# A `sablonok/` mappában van, mert a Dockerfile azt a mappát egészében másolja
-# (így a tudásbázishoz nem kell külön COPY sor).
-_TUDASBAZIS_FAJL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sablonok", "szoveg_tudasbazis.md")
-try:
-    with open(_TUDASBAZIS_FAJL, encoding="utf-8") as f:
-        _TUDASBAZIS = f.read()
-except OSError:
-    _TUDASBAZIS = ""
-    log.warning(f"[SZOVEG-AI] A tudásbázis nem található: {_TUDASBAZIS_FAJL} — tudásbázis nélkül fut")
+# 2026-09-29: a tudásbázis KÉT részre vált:
+#   • STÍLUSLEÍRÁS — a webappban szerkeszthető (Szövegtár → AI stílusleírás,
+#     Firestore: katalogus/szoveg_stilus); a webapp minden kérésben elküldi
+#     („stilus" mező). Ha nem küldi, a sablonok/szoveg_stilus.md a tartalék.
+#   • MINTASZÖVEGEK — itt, a GitHubon: sablonok/szoveg_mintak.md (a
+#     felhasználó nem tervezi szerkeszteni). Ez a nagyobb rész, ezt cache-eljük.
+# A `sablonok/` mappát a Dockerfile egészében másolja — nem kell külön COPY sor.
+_SABLONOK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sablonok")
+
+
+def _olvas(nev: str) -> str:
+    try:
+        with open(os.path.join(_SABLONOK, nev), encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        log.warning(f"[SZOVEG-AI] Nem található: sablonok/{nev}")
+        return ""
+
+
+_MINTAK = _olvas("szoveg_mintak.md")
+_STILUS_TARTALEK = _olvas("szoveg_stilus.md")
+_STILUS_MAX = 20000
 
 _SZEREP = (
     "Az SQM Hungary Kft. (ipari padlóbevonatok, műgyanta és PU rendszerek, "
-    "padlófelújítás) árajánlat-szövegeit írod magyarul. Az alábbi tudásbázis "
-    "írja le a hangvételt, a szókincset, a kategóriánkénti felépítést, és "
-    "tartalmaz jóváhagyott mintaszövegeket. Ezekhez igazodj, de ne másold "
-    "szó szerint.\n\n"
+    "padlófelújítás) árajánlat-szövegeit írod magyarul. Lent egy STÍLUSLEÍRÁS "
+    "(hangvétel, szókincs, kategóriánkénti felépítés — ez a mérvadó szabály) és "
+    "jóváhagyott MINTASZÖVEGEK vannak. A mintákhoz igazodj hangvételben, de ne "
+    "másold őket szó szerint (a „VERBATIM” jelölés a gyűjtemény belső jelölése, "
+    "nem neked szól).\n\n"
     "SZIGORÚ KIMENETI SZABÁLY: kizárólag a kész szöveget add vissza — nincs "
     "bevezetés, nincs magyarázat, nincs cím, nincs idézőjel a szöveg körül, "
     "nincs felsorolás (ha nem kérik). Folyó szöveg. Ne találj ki számokat, "
@@ -178,13 +192,19 @@ def _uzenet(d: dict) -> str:
     return "\n".join(sorok)
 
 
-def _claude(uzenet, max_tokens: int = 900) -> str:
-    """`uzenet`: egy felhasználói üzenet (str), vagy kész üzenetlista."""
+def _claude(uzenet, max_tokens: int = 900, stilus: str = "") -> str:
+    """`uzenet`: egy felhasználói üzenet (str), vagy kész üzenetlista.
+    `stilus`: a webappból küldött stílusleírás (üresen a fájlbeli tartalék)."""
     messages = uzenet if isinstance(uzenet, list) else [{"role": "user", "content": uzenet}]
     system = [{"type": "text", "text": _SZEREP}]
-    if _TUDASBAZIS:
-        system.append({"type": "text", "text": "TUDÁSBÁZIS:\n\n" + _TUDASBAZIS,
+    # A nagy, változatlan mintagyűjtemény ELŐL, cache-elve; a (szerkeszthető,
+    # rövid) stílusleírás UTÁNA — így a stílus módosítása nem rontja a cache-t.
+    if _MINTAK:
+        system.append({"type": "text", "text": "JÓVÁHAGYOTT MINTASZÖVEGEK:\n\n" + _MINTAK,
                        "cache_control": {"type": "ephemeral"}})
+    st = (stilus or "").strip()[:_STILUS_MAX] or _STILUS_TARTALEK
+    if st:
+        system.append({"type": "text", "text": "STÍLUSLEÍRÁS (mérvadó):\n\n" + st})
     r = requests.post(
         _ANTHROPIC_URL,
         headers={
@@ -223,9 +243,10 @@ def register_szoveg_ai_routes(app):
         if d.get("mod") == "igazitas" and not (d.get("alapSzoveg") or "").strip():
             return jsonify({"ok": False, "error": "Igazításhoz hiányzik az alapszöveg"}), 400
         rovid = d.get("hossz") == "rovid"
+        stilus = d.get("stilus") if isinstance(d.get("stilus"), str) else ""
         try:
             uzenet = _uzenet(d)
-            szoveg = _claude(uzenet, max_tokens=300 if rovid else 900)
+            szoveg = _claude(uzenet, max_tokens=300 if rovid else 900, stilus=stilus)
             # Rövid módban a hossz szerveroldali ellenőrzése: ha így is túl
             # hosszú lett, egyszer rövidíttetjük (a modell a saját szövegét kapja vissza).
             if rovid and szoveg and _szoszam(szoveg) > _ROVID_TURES_SZO:
@@ -237,7 +258,7 @@ def register_szoveg_ai_routes(app):
                         f"Ez túl hosszú. Írd át TERC-tételsorrá: legfeljebb 2 mondat, legfeljebb "
                         f"{_ROVID_MAX_SZO} szó, csak mit/mivel/milyen lépésekkel, indoklás és "
                         "körülmények nélkül. Csak a kész szöveget add vissza."},
-                ], max_tokens=300)
+                ], max_tokens=300, stilus=stilus)
                 if rovidebb:
                     szoveg = rovidebb
         except Exception as e:
@@ -249,4 +270,5 @@ def register_szoveg_ai_routes(app):
         return jsonify({"ok": True, "szoveg": szoveg})
 
     log.info(f"[SZOVEG-AI] Végpont regisztrálva: /szoveg-javaslat (modell: {SZOVEG_AI_MODEL}, "
-             f"tudásbázis: {len(_TUDASBAZIS)} karakter, kulcs: {'van' if ANTHROPIC_API_KEY else 'NINCS'})")
+             f"minták: {len(_MINTAK)} kar., tartalék stílus: {len(_STILUS_TARTALEK)} kar., "
+             f"kulcs: {'van' if ANTHROPIC_API_KEY else 'NINCS'})")
