@@ -15,6 +15,32 @@ Végpontok:
   POST /pipedrive-consume-imports   – webapp hívja bejelentkezés után
   POST /pipedrive-set-project-url   – webapp hívja projekt létrehozás után
   GET  /pipedrive-import/<token>    – egyszeri token alapú lekérdezés
+  GET  /pipedrive-import-by-project/<project_id>
+                                    – ÁLLAPOTMENTES helyreállítás (2026-09-29)
+
+2026-09-29 — HIBAJAVÍTÁS: elveszett Pipedrive-projektek
+-------------------------------------------------------
+A függőben lévő importok CSAK memóriában vannak (_pd_imports). Ha a Railway
+újraindul/újratelepül, mielőtt valaki megnyitná a webappot, a várólista
+elveszik — a Pipedrive-ba viszont a ?p=<project_id> link már be van írva,
+így a link egy SOHA LÉTRE NEM JÖTT projektre mutat (élesben: mtwogbdvqwoo,
+2026-09-11 10:11, aznap a szerver többször újraindult). Ugyanez történik, ha
+a webapp kiürítette a várólistát, de a Firestore-mentés elbukott.
+
+Javítás, két részben:
+  1. Az új projekt-azonosító MAGÁBAN HORDOZZA a deal ID-t:
+       pd<deal_id>-<ts36><4 véletlen>   pl. pd1234-mtwogbdvqwoo
+     Így a linkből bármikor kiderül, melyik dealhez tartozik.
+  2. Új végpont: GET /pipedrive-import-by-project/<project_id> — ha a webapp
+     egy ?p= linknél nem találja a projektet (és a várólistán sincs), ezt
+     hívja. A szerver a deal adatait FRISSEN lekéri a Pipedrive-ból (nincs
+     szükség tárolt állapotra), és ugyanabban a formában adja vissza, mint a
+     várólista — a webapp ebből, PONTOSAN ezzel az azonosítóval hozza létre a
+     projektet. Régi formátumú azonosítóknál (deal ID nélkül, pl.
+     mtwogbdvqwoo) a Pipedrive-keresővel keresi meg azt a dealt, amelynek
+     Kalkulátor URL mezője ezt az azonosítót tartalmazza.
+A memóriabeli várólista maradt (a gyors, szokásos út), csak már nem ez az
+egyetlen út.
 """
 
 import os
@@ -23,6 +49,7 @@ import uuid
 import random
 import logging
 import threading
+import re
 
 import requests
 from flask import request, jsonify
@@ -102,14 +129,83 @@ def _pd_write_webapp_url(deal_id: int, webapp_url: str):
     log.info(f"[PD] URL visszaírva deal #{deal_id}: {webapp_url}")
 
 
-def _gen_project_id() -> str:
-    """Ugyanaz a formátum mint a webapp JS-ben (base36 timestamp + 4 random char)."""
+def _gen_project_id(deal_id=None) -> str:
+    """base36 timestamp + 4 véletlen karakter (mint a webapp JS-ben).
+    2026-09-29: ha van deal_id, előtagként bekerül (pd<deal_id>-...), hogy a
+    projekt a linkből bármikor, tárolt állapot nélkül is helyreállítható
+    legyen (lásd /pipedrive-import-by-project)."""
     _chars = "0123456789abcdefghijklmnopqrstuvwxyz"
     ts36, n = "", int(time.time() * 1000)
     while n:
         ts36 = _chars[n % 36] + ts36
         n //= 36
-    return ts36 + "".join(random.choices(_chars, k=4))
+    base = ts36 + "".join(random.choices(_chars, k=4))
+    return f"pd{int(deal_id)}-{base}" if deal_id else base
+
+
+_PD_PROJECT_ID_RE = re.compile(r"^pd(\d+)-[0-9a-z]+$")
+
+
+def _deal_id_from_project_id(project_id: str):
+    """pd<deal_id>-... formátumból a deal ID, különben None."""
+    m = _PD_PROJECT_ID_RE.match(project_id or "")
+    return int(m.group(1)) if m else None
+
+
+def _build_import(deal_id: int, project_id: str) -> dict:
+    """A deal (+ szervezet) adataiból az import-rekord — ugyanaz a szerkezet,
+    amit a várólista is tárol. Kivételt dob, ha a deal nem kérhető le."""
+    deal      = _pd_fetch_deal(deal_id)
+    deal_name = (deal.get("title") or f"Deal #{deal_id}").strip()
+    cegnev    = (deal.get("org_name") or "").strip()
+    helyszin  = (deal.get(_PD_FIELD_HELYSZIN) or "").strip()
+    adoszam, szekhely = "", ""
+    org_ref    = deal.get("org_id")
+    org_id_val = (org_ref.get("value") if isinstance(org_ref, dict) else org_ref) if org_ref else None
+    if org_id_val:
+        try:
+            org      = _pd_fetch_org(int(org_id_val))
+            szekhely = (org.get("address") or "").strip()
+            adoszam  = (org.get(_PD_ORG_FIELD_ADOSZAM) or "").strip()
+        except Exception as e:
+            log.warning(f"[PD] Szervezet lekérés sikertelen (org #{org_id_val}): {e}")
+    return {
+        "nev": deal_name, "helyszin": helyszin, "cegnev": cegnev,
+        "adoszam": adoszam, "szekhely": szekhely,
+        "deal_id": deal_id, "project_id": project_id,
+    }
+
+
+def _find_deal_by_project_id(project_id: str):
+    """Régi formátumú azonosítóhoz (deal ID nélkül): megkeresi azt a dealt,
+    amelynek Kalkulátor URL mezője ezt a project_id-t tartalmazza. Legjobb
+    szándékú keresés — a találatot MINDIG ellenőrizzük a mező tényleges
+    értékével, hogy véletlenül se rossz dealhez kössük a projektet."""
+    if not _PD_FIELD_WEBAPP_URL:
+        return None
+    url = "https://api.pipedrive.com/v1/deals/search"
+    for term in (project_id, f"p={project_id}"):
+        try:
+            r = requests.get(url, params={
+                "api_token": PIPEDRIVE_API_TOKEN, "term": term,
+                "fields": "custom_fields", "limit": 10,
+            }, timeout=10)
+            r.raise_for_status()
+            items = (r.json().get("data") or {}).get("items") or []
+        except Exception as e:
+            log.warning(f"[PD] Deal-keresés sikertelen ({term}): {e}")
+            continue
+        for it in items:
+            did = (it.get("item") or {}).get("id")
+            if not did:
+                continue
+            try:
+                deal = _pd_fetch_deal(int(did))
+            except Exception:
+                continue
+            if project_id in str(deal.get(_PD_FIELD_WEBAPP_URL) or ""):
+                return int(did)
+    return None
 
 
 # ── Flask route regisztráció ──────────────────────────────────────────────────
@@ -141,46 +237,22 @@ def register_pipedrive_webapp_routes(app):
         except (ValueError, TypeError):
             return jsonify({"error": f"Érvénytelen deal_id: {deal_id}"}), 400
 
-        # 1) Deal adatok kiolvasása Pipedrive-ból
+        # 1) Deal + szervezet adatok. A projekt-azonosító már a deal ID-t is
+        #    tartalmazza — lásd a fájl eleji 2026-09-29-es megjegyzést.
+        project_id = _gen_project_id(deal_id)
         try:
-            deal = _pd_fetch_deal(deal_id)
+            imp = _build_import(deal_id, project_id)
         except Exception as e:
             log.error(f"[PD] Deal lekérés sikertelen #{deal_id}: {e}")
             return jsonify({"error": f"Pipedrive API hiba: {e}"}), 502
 
-        deal_name = (deal.get("title") or f"Deal #{deal_id}").strip()
-        cegnev    = (deal.get("org_name") or "").strip()
-        helyszin  = (deal.get(_PD_FIELD_HELYSZIN) or "").strip()
+        log.info(f"[PD] Deal #{deal_id}: '{imp['nev']}' | cég: '{imp['cegnev']}' | helyszín: '{imp['helyszin']}' | székhely: '{imp['szekhely']}' | adószám: '{imp['adoszam']}'")
 
-        # 2) Szervezet adatok (székhely, adószám)
-        adoszam  = ""
-        szekhely = ""
-        org_ref     = deal.get("org_id")
-        org_id_val  = (org_ref.get("value") if isinstance(org_ref, dict) else org_ref) if org_ref else None
-        if org_id_val:
-            try:
-                org      = _pd_fetch_org(int(org_id_val))
-                szekhely = (org.get("address") or "").strip()
-                adoszam  = (org.get(_PD_ORG_FIELD_ADOSZAM) or "").strip()
-            except Exception as e:
-                log.warning(f"[PD] Szervezet lekérés sikertelen (org #{org_id_val}): {e}")
-
-        log.info(f"[PD] Deal #{deal_id}: '{deal_name}' | cég: '{cegnev}' | helyszín: '{helyszin}' | székhely: '{szekhely}' | adószám: '{adoszam}'")
-
-        # 3) Token generálás és adatok memóriában tárolása
-        project_id = _gen_project_id()
-        token      = str(uuid.uuid4()).replace("-", "")
+        # 2) Várólistára (gyors út). Ha ez egy újraindulásnál elveszik, a
+        #    webapp a /pipedrive-import-by-project végponttal helyreállítja.
+        token = str(uuid.uuid4()).replace("-", "")
         with _pd_imports_lock:
-            _pd_imports[token] = {
-                "nev":        deal_name,
-                "helyszin":   helyszin,
-                "cegnev":     cegnev,
-                "adoszam":    adoszam,
-                "szekhely":   szekhely,
-                "deal_id":    deal_id,
-                "project_id": project_id,
-                "created_at": time.time()
-            }
+            _pd_imports[token] = {**imp, "created_at": time.time()}
 
         # 4) Webapp projekt URL visszaírása Pipedrive-ba
         base        = (WEBAPP_BASE_URL or "").rstrip("/")
@@ -364,6 +436,37 @@ def register_pipedrive_webapp_routes(app):
             log.error(f"[PD] Napok visszaírás sikertelen deal #{deal_id}: {e}")
             return jsonify({"ok": False, "error": str(e)}), 502
 
+    @app.route("/pipedrive-import-by-project/<project_id>", methods=["GET"])
+    def pipedrive_import_by_project(project_id):
+        """ÁLLAPOTMENTES helyreállítás (2026-09-29): a webapp hívja, ha egy
+        ?p=<project_id> linkhez nem talál projektet. A deal adatait frissen
+        lekéri a Pipedrive-ból, és import-rekordként adja vissza — a webapp
+        ebből ugyanezzel az azonosítóval hozza létre a projektet."""
+        project_id = (project_id or "").strip().lower()
+        if not re.fullmatch(r"[0-9a-z-]{6,40}", project_id):
+            return jsonify({"ok": False, "error": "Érvénytelen projekt-azonosító"}), 400
+
+        # Ha még a memóriabeli várólistán van, azt adjuk (és levesszük róla).
+        with _pd_imports_lock:
+            for t, v in list(_pd_imports.items()):
+                if v.get("project_id") == project_id:
+                    _pd_imports.pop(t, None)
+                    rec = {k: v.get(k, "") for k in ("nev", "helyszin", "cegnev", "adoszam", "szekhely", "deal_id", "project_id")}
+                    log.info(f"[PD] import-by-project: {project_id} a várólistáról")
+                    return jsonify({"ok": True, "import": rec})
+
+        deal_id = _deal_id_from_project_id(project_id) or _find_deal_by_project_id(project_id)
+        if not deal_id:
+            log.warning(f"[PD] import-by-project: nincs deal ehhez: {project_id}")
+            return jsonify({"ok": False, "error": "Nem található Pipedrive deal ehhez a projekthez"}), 404
+        try:
+            rec = _build_import(deal_id, project_id)
+        except Exception as e:
+            log.error(f"[PD] import-by-project: deal #{deal_id} lekérés sikertelen: {e}")
+            return jsonify({"ok": False, "error": f"Pipedrive API hiba: {e}"}), 502
+        log.info(f"[PD] import-by-project: {project_id} helyreállítva deal #{deal_id} alapján ('{rec['nev']}')")
+        return jsonify({"ok": True, "import": rec})
+
     @app.route("/pipedrive-import/<token>", methods=["GET"])
     def pipedrive_import_data(token):
         """Egyszeri token alapú lekérdezés (legacy endpoint)."""
@@ -380,4 +483,4 @@ def register_pipedrive_webapp_routes(app):
             "cegnev": entry["cegnev"], "deal_id": entry["deal_id"]
         })
 
-    log.info("[PD] Végpontok regisztrálva: /pipedrive-deal-webhook, /pipedrive-consume-imports, /pipedrive-set-project-url, /pipedrive-import/<token>")
+    log.info("[PD] Végpontok regisztrálva: /pipedrive-deal-webhook, /pipedrive-consume-imports, /pipedrive-set-project-url, /pipedrive-import/<token>, /pipedrive-import-by-project/<project_id>")
