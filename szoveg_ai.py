@@ -69,6 +69,46 @@ _SZEREP = (
 
 _MAX = {"kulcsszavak": 600, "alapSzoveg": 4000, "jegyzet": 1200, "minta": 2500}
 
+# 2026-09-29 — HANGOLÁS: élesben a „rövid TERC-sor" és a „részletes" beállítás
+# szinte ugyanolyan hosszú (4 mondatos) szöveget adott. Okok: (1) a hossz csak
+# egy sor volt a sok kontextus között, (2) a tudásbázis kategóriánkénti
+# felépítési mintája (pl. anyagköltség: jelleg → rendszer → mit biztosít →
+# zárás) eleve 4 mondatot „kér", (3) a mellékelt minták hosszú, részletes
+# szövegek voltak, és a modell a hosszukat is utánozta, (4) a modell minden
+# kapott adatot (páratartalom, tárcsa, m²) bele akart írni. Javítás: a rövid
+# módnak saját, szigorú szabálya és saját (valódi SQM TERC-) példái vannak,
+# a hosszú mintákat rövid módban nem küldjük, a kimenet hosszát a szerver
+# ellenőrzi, és ha túl hosszú, egyszer rövidíttet.
+_ROVID_MAX_SZO = 45
+_ROVID_TURES_SZO = 60          # e fölött egyszer újrarövidíttetjük
+_ROVID_MINTA_MAX_KAR = 350     # ennél hosszabb mentett mintát rövid módban nem küldünk
+
+_ROVID_SZABALY = (
+    "HOSSZ — SZIGORÚ: rövid TERC-tételsor. Legfeljebb 2 mondat, összesen legfeljebb "
+    f"{_ROVID_MAX_SZO} szó. Költségvetési tételsor-szerkezet: mit, mivel, milyen technológiai "
+    "lépésekkel — névszói, tömör megfogalmazás (pl. „… kivitelezése …, …-val, majd …-val.”). "
+    "NE indokolj, NE sorolj anyagtulajdonságokat vagy előnyöket, NE írj „ez hozzájárul…”, "
+    "„ezáltal…” típusú magyarázó mondatot, és a projekt-körülményeket (páratartalom, "
+    "hőmérséklet stb.) NE említsd. Ilyenkor a tudásbázis kategóriánkénti felépítési mintáját "
+    "NE kövesd — az a részletes leírásra vonatkozik.\n\n"
+    "Valódi SQM TERC-példák a kívánt hosszra és szerkezetre:\n"
+    "- Repedés javítása, a repedés feltárásával, gyantahabarccsal történő kitöltésével, majd "
+    "kötést követő síkba csiszolással.\n"
+    "- Olajszennyezett betonfelület feltárása a meglévő gyantaréteg eltávolításával, a szennyezett "
+    "betonfelület HVP O olajeltávolító vegyszeres tisztításával, majd HVP O alapozógyantával "
+    "történő alapozásával.\n"
+    "- 3 rétegű műgyanta bevonatrendszer kivitelezése, a felület előkészítését követően alapozó, "
+    "közbenső és fedőréteg technológiai sorrend szerinti felhordásával."
+)
+
+_RESZLETES_SZABALY = (
+    "HOSSZ: részletes leírás, 3–6 mondat, a tudásbázis kategóriánkénti felépítési mintája szerint."
+)
+
+
+def _szoszam(s: str) -> int:
+    return len((s or "").split())
+
 
 def _vag(s, n):
     s = (s or "").strip() if isinstance(s, str) else ""
@@ -91,7 +131,11 @@ def _uzenet(d: dict) -> str:
     alap       = _vag(d.get("alapSzoveg"), _MAX["alapSzoveg"])
     mintak     = [_vag(m, _MAX["minta"]) for m in (d.get("mintak") or [])[:3] if isinstance(m, str) and m.strip()]
 
-    sorok = []
+    if hossz == "rovid":
+        mintak = [m for m in mintak if len(m) <= _ROVID_MINTA_MAX_KAR]
+    hossz_szabaly = _ROVID_SZABALY if hossz == "rovid" else _RESZLETES_SZABALY
+
+    sorok = [hossz_szabaly, ""]
     if mod == "igazitas":
         sorok.append(
             "Az alábbi, korábban jóváhagyott SQM-szöveget igazítsd a jelenlegi projekthez. "
@@ -105,7 +149,11 @@ def _uzenet(d: dict) -> str:
         sorok.append("Írj ajánlati szöveget az alábbi tételhez az SQM stílusában.")
 
     sorok.append(f"\nKategória: {kategoria}")
-    sorok.append("Hossz: " + ("rövid TERC-tételsor, 1–3 mondat" if hossz == "rovid" else "részletes leírás, 3–6 mondat"))
+    sorok.append(
+        "Az alábbi projektadatok HÁTTÉRINFORMÁCIÓK: nem kell mindet beleírni. Csak azt használd, "
+        "ami a tétel tartalmát ténylegesen meghatározza (anyag, technológia, mennyiség); a "
+        "körülményeket csak akkor említsd, ha a kivitelezést érdemben befolyásolják."
+    )
     if tetel_nev:
         m = f" — {menny} {egyseg}".rstrip() if menny not in (None, "") else ""
         sorok.append(f"Tétel: {tetel_nev}{m}")
@@ -124,11 +172,15 @@ def _uzenet(d: dict) -> str:
         sorok.append("\nHasonló tételekhez korábban jóváhagyott SQM-szövegek (hangvétel és részletesség mintájaként, NE másold):")
         for i, m in enumerate(mintak, 1):
             sorok.append(f"--- {i}. minta ---\n{m}")
+    if hossz == "rovid":
+        sorok.append(f"\nEMLÉKEZTETŐ: legfeljebb 2 mondat, legfeljebb {_ROVID_MAX_SZO} szó, TERC-stílus, magyarázat nélkül.")
     sorok.append("\nCsak a kész szöveget add vissza.")
     return "\n".join(sorok)
 
 
-def _claude(uzenet: str) -> str:
+def _claude(uzenet, max_tokens: int = 900) -> str:
+    """`uzenet`: egy felhasználói üzenet (str), vagy kész üzenetlista."""
+    messages = uzenet if isinstance(uzenet, list) else [{"role": "user", "content": uzenet}]
     system = [{"type": "text", "text": _SZEREP}]
     if _TUDASBAZIS:
         system.append({"type": "text", "text": "TUDÁSBÁZIS:\n\n" + _TUDASBAZIS,
@@ -142,9 +194,9 @@ def _claude(uzenet: str) -> str:
         },
         json={
             "model": SZOVEG_AI_MODEL,
-            "max_tokens": 900,
+            "max_tokens": max_tokens,
             "system": system,
-            "messages": [{"role": "user", "content": uzenet}],
+            "messages": messages,
         },
         timeout=55,
     )
@@ -170,14 +222,30 @@ def register_szoveg_ai_routes(app):
         d = request.get_json(silent=True) or {}
         if d.get("mod") == "igazitas" and not (d.get("alapSzoveg") or "").strip():
             return jsonify({"ok": False, "error": "Igazításhoz hiányzik az alapszöveg"}), 400
+        rovid = d.get("hossz") == "rovid"
         try:
-            szoveg = _claude(_uzenet(d))
+            uzenet = _uzenet(d)
+            szoveg = _claude(uzenet, max_tokens=300 if rovid else 900)
+            # Rövid módban a hossz szerveroldali ellenőrzése: ha így is túl
+            # hosszú lett, egyszer rövidíttetjük (a modell a saját szövegét kapja vissza).
+            if rovid and szoveg and _szoszam(szoveg) > _ROVID_TURES_SZO:
+                log.info(f"[SZOVEG-AI] rövid mód: {_szoszam(szoveg)} szó — újrarövidítés")
+                rovidebb = _claude([
+                    {"role": "user", "content": uzenet},
+                    {"role": "assistant", "content": szoveg},
+                    {"role": "user", "content":
+                        f"Ez túl hosszú. Írd át TERC-tételsorrá: legfeljebb 2 mondat, legfeljebb "
+                        f"{_ROVID_MAX_SZO} szó, csak mit/mivel/milyen lépésekkel, indoklás és "
+                        "körülmények nélkül. Csak a kész szöveget add vissza."},
+                ], max_tokens=300)
+                if rovidebb:
+                    szoveg = rovidebb
         except Exception as e:
             log.error(f"[SZOVEG-AI] Hiba: {e}")
             return jsonify({"ok": False, "error": "Az AI-hívás nem sikerült. Próbáld újra később."}), 502
         if not szoveg:
             return jsonify({"ok": False, "error": "Az AI üres választ adott. Próbáld újra."}), 502
-        log.info(f"[SZOVEG-AI] {d.get('mod', 'uj')} | {(d.get('tetel') or {}).get('nev', '')[:60]} | {len(szoveg)} karakter")
+        log.info(f"[SZOVEG-AI] {d.get('mod', 'uj')} | {'rövid' if rovid else 'részletes'} | {(d.get('tetel') or {}).get('nev', '')[:60]} | {_szoszam(szoveg)} szó")
         return jsonify({"ok": True, "szoveg": szoveg})
 
     log.info(f"[SZOVEG-AI] Végpont regisztrálva: /szoveg-javaslat (modell: {SZOVEG_AI_MODEL}, "
