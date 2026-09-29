@@ -10,6 +10,11 @@ CALLBACK ARCHITEKTÚRA:
   3. Ha kész a BID szám, Railway visszahívja a webapp_script.js Web App-ot
   4. A webapp_script.js átnevezi a fájlt [BID-XXXX-NNN]-re
   → Nincs többé timeout probléma
+
+2026-09-29: a WEBAPP is háttér-módban hív ("async_mode": true) — az eredmény a
+BID-postaládába kerül (fájl egy Railway Volume-on, /data), a webapp onnan
+kérdezi le: GET /arajanlat-eredmeny/<project_id>, GET /arajanlat-eredmenyek.
+Lásd a „BID-POSTALÁDA" szakaszt lent.
 """
 
 import os
@@ -18,6 +23,9 @@ import base64
 import logging
 import traceback
 import asyncio
+import json
+import time
+import threading
 
 import requests as req_lib
 from flask import request, jsonify
@@ -31,6 +39,85 @@ from innonest_core import (
 log = logging.getLogger(__name__)
 
 API_KEY = os.environ.get("API_KEY", "titkos-kulcs")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BID-POSTALÁDA (2026-09-29) — a webapp háttér-feltöltéséhez
+# ══════════════════════════════════════════════════════════════════════════════
+# A feltöltés 100+ mp-ig is tarthat; a webapp korábban 90 mp után feladta a
+# várakozást, és a (sikeresen elkészült) ajánlat BID-je sosem jutott vissza a
+# projektbe. Mostantól a webapp „async_mode"-ban hív: a végpont azonnal
+# visszatér, a Playwright a háttérben fut, az eredményt pedig ide, projekt-
+# azonosító szerint írjuk. A webapp innen kérdezi le (/arajanlat-eredmeny/<id>),
+# a Mentett projektek lista pedig a még át nem vett BID-eket söpri be
+# (/arajanlat-eredmenyek).
+#
+# A postaláda FÁJLBAN van, hogy újraindulást/összeomlást is túléljen: Railway
+# Volume-ra kell csatolni (Mount path: /data — vagy a BID_POSTALADA_DIR env).
+# Ha nincs Volume, /tmp-be ír (az újratelepítéskor törlődik) és figyelmeztet.
+_POSTALADA_MEGORZES = 30 * 24 * 3600
+_postalada_lock = threading.Lock()
+
+
+def _postalada_konyvtar() -> str:
+    d = os.environ.get("BID_POSTALADA_DIR", "/data")
+    try:
+        if os.path.isdir(d) and os.access(d, os.W_OK):
+            return d
+    except Exception:
+        pass
+    return "/tmp"
+
+
+_POSTALADA_DIR = _postalada_konyvtar()
+_POSTALADA_FAJL = os.path.join(_POSTALADA_DIR, "bid_postalada.json")
+if _POSTALADA_DIR != os.environ.get("BID_POSTALADA_DIR", "/data"):
+    log.warning(f"[BID-POSTALADA] Nincs írható Volume ({os.environ.get('BID_POSTALADA_DIR', '/data')}) — "
+                f"a postaláda {_POSTALADA_FAJL}-ba kerül, ÚJRAINDULÁSKOR TÖRLŐDIK")
+else:
+    log.info(f"[BID-POSTALADA] Postaláda: {_POSTALADA_FAJL}")
+
+
+def _postalada_olvas() -> dict:
+    try:
+        with open(_POSTALADA_FAJL, encoding="utf-8") as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _postalada_ir(project_id: str, **mezok):
+    """Egy projekt bejegyzésének frissítése (atomikus fájlcsere, régi tételek törlése)."""
+    if not project_id:
+        return
+    with _postalada_lock:
+        d = _postalada_olvas()
+        most = time.time()
+        d = {k: v for k, v in d.items() if most - (v.get("ts") or 0) < _POSTALADA_MEGORZES}
+        rec = dict(d.get(project_id) or {})
+        rec.update(mezok)
+        rec["ts"] = most
+        d[project_id] = rec
+        tmp = _POSTALADA_FAJL + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(d, f, ensure_ascii=False)
+            os.replace(tmp, _POSTALADA_FAJL)
+        except OSError as e:
+            log.error(f"[BID-POSTALADA] Írási hiba: {e}")
+
+
+_PROJEKT_ID_RE = re.compile(r"[?&]p=([0-9a-z-]{6,40})")
+
+
+def _projekt_id(payload: dict) -> str:
+    """A webapp külön is küldi (project_id); tartalékként a projekt URL-ből."""
+    pid = (payload.get("project_id") or "").strip().lower()
+    if pid:
+        return pid
+    m = _PROJEKT_ID_RE.search(payload.get("projekt_url") or "")
+    return m.group(1) if m else ""
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -902,6 +989,10 @@ async def run_automation(payload: dict):
 
         if bid_szam:
             log.info(f"BID szám: {bid_szam}")
+            # 2026-09-29: AZONNAL a postaládába — még a csatolmány és a
+            # megjegyzés előtt, hogy egy későbbi összeomlás se vigye el.
+            if payload.get("async_mode"):
+                _postalada_ir(_projekt_id(payload), allapot="kesz", bid=bid_szam, url=page.url)
 
         # Csatolmány feltöltés
         csatolmany = payload.get("csatolmany")
@@ -988,6 +1079,26 @@ async def run_automation_background(payload: dict):
         log.error(traceback.format_exc())
 
 
+async def run_automation_postalada(payload: dict):
+    """2026-09-29: háttérfutás a webapp számára — az eredmény a BID-postaládába
+    kerül (lásd fent), a webapp onnan kérdezi le."""
+    pid = _projekt_id(payload)
+    try:
+        result = await run_automation(payload)
+        bid = result.get("bid_szam")
+        if bid:
+            _postalada_ir(pid, allapot="kesz", bid=bid, url=result.get("url", ""),
+                          unmatched_materials=result.get("unmatched_materials") or [])
+            log.info(f"[BID-POSTALADA] {pid}: kész — {bid}")
+        else:
+            _postalada_ir(pid, allapot="hiba", hiba="Az ajánlat elkészült(het)ett, de a BID számot nem sikerült kiolvasni az Innonestből.")
+            log.error(f"[BID-POSTALADA] {pid}: nincs BID a mentés után")
+    except Exception as e:
+        _postalada_ir(pid, allapot="hiba", hiba=str(e)[:300])
+        log.error(f"[BID-POSTALADA] {pid}: hiba — {e}")
+        log.error(traceback.format_exc())
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # FLASK VÉGPONT REGISZTRÁCIÓ
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1005,6 +1116,16 @@ def register_arajanlat_routes(app):
             return jsonify({"error": "Hiányzó JSON"}), 400
 
         from innonest_core import _loop
+
+        # ── 2026-09-29: webapp háttér-mód (BID-postaláda) ─────────────────
+        if payload.get("async_mode"):
+            pid = _projekt_id(payload)
+            if not pid:
+                return jsonify({"ok": False, "error": "Hiányzik a project_id"}), 400
+            _postalada_ir(pid, allapot="folyamatban", bid="", hiba="", inditva=time.time())
+            asyncio.run_coroutine_threadsafe(run_automation_postalada(payload), _loop)
+            log.info(f"[BID-POSTALADA] {pid}: feltöltés háttérbe indítva")
+            return jsonify({"ok": True, "status": "processing", "project_id": pid})
 
         if payload.get("callback_url"):
             # ── ÚJ: callback mód ──────────────────────────────────────────
@@ -1031,4 +1152,25 @@ def register_arajanlat_routes(app):
                 log.error(traceback.format_exc())
                 return jsonify({"error": str(e)}), 500
 
-    log.info("[ARAJANLAT] Végpont regisztrálva: /create-arajanlat")
+    @app.route("/arajanlat-eredmeny/<project_id>", methods=["GET"])
+    def arajanlat_eredmeny(project_id):
+        """Egy projekt feltöltésének állapota a postaládából:
+        {ok, allapot: folyamatban|kesz|hiba|ismeretlen, bid, hiba, unmatched_materials}"""
+        if request.headers.get("X-API-Key") != API_KEY:
+            return jsonify({"ok": False, "error": "Unauthorized"}), 401
+        rec = _postalada_olvas().get((project_id or "").strip().lower())
+        if not rec:
+            return jsonify({"ok": True, "allapot": "ismeretlen"})
+        return jsonify({"ok": True, **{k: v for k, v in rec.items() if k != "url"}})
+
+    @app.route("/arajanlat-eredmenyek", methods=["GET"])
+    def arajanlat_eredmenyek():
+        """Az összes KÉSZ (BID-del rendelkező) bejegyzés { project_id: bid } —
+        a Mentett projektek lista ebből pótolja a hiányzó BID-eket."""
+        if request.headers.get("X-API-Key") != API_KEY:
+            return jsonify({"ok": False, "error": "Unauthorized"}), 401
+        d = _postalada_olvas()
+        items = {pid: v.get("bid") for pid, v in d.items() if v.get("allapot") == "kesz" and v.get("bid")}
+        return jsonify({"ok": True, "items": items})
+
+    log.info("[ARAJANLAT] Végpontok regisztrálva: /create-arajanlat, /arajanlat-eredmeny/<id>, /arajanlat-eredmenyek")
