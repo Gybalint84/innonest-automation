@@ -39,6 +39,7 @@ import hashlib
 import datetime
 import re
 import logging
+import uuid
 import requests
 from urllib.parse import quote
 from flask import Blueprint, request, jsonify
@@ -688,59 +689,118 @@ def arbekero_kitolt(adatok: dict) -> str:
 # NEM a megrendelés-figyelő scriptje). handleSendEmail "cc" mezőt is fogad
 # (GmailApp.sendEmail options.cc) — valódi Cc fejléc, nem külön email.
 # ─────────────────────────────────────────────
-def email_kuld(cimzett: str, targy: str, html_body: str, cc: str = "") -> bool:
-    try:
-        payload = {
-            "secret":   EMAIL_WEBAPP_SECRET,
-            "action":   "sendEmail",
-            "to":       cimzett,
-            "subject":  targy,
-            "htmlBody": html_body,
-        }
-        if cc:
-            payload["cc"] = cc
-        r = requests.post(EMAIL_WEBAPP_URL, json=payload, timeout=30)
-        resp = r.json()
+EMAIL_KISERLETEK = 3     # próbálkozások száma (a requestId miatt biztonságos)
+EMAIL_VARAKOZAS  = 3     # mp két próbálkozás között
+
+
+def _kuldes_azonosito(*reszek) -> str:
+    """Rövid, determinisztikus requestId (az Apps Script cache-kulcsához)."""
+    return hashlib.sha1("|".join(str(r) for r in reszek).encode("utf-8")).hexdigest()[:24]
+
+
+def _apps_script_email(payload: dict, request_id: str, tag: str, read_timeout: int) -> str:
+    """
+    Közös küldő az "SQM Email Küldő" Apps Scripthez.
+
+    Visszatérés: "ok" | "hiba" | "bizonytalan"
+      ok          – az Apps Script JSON-ban megerősítette (vagy duplikátumként jelezte)
+      hiba        – az Apps Script JSON-ban hibát jelzett → biztosan NEM ment ki
+      bizonytalan – egyik próbálkozásra sem jött értelmezhető válasz
+
+    A requestId miatt az újrapróbálás nem küld dupla levelet: ha az első
+    hívás kiküldte, csak a válasz veszett el (302 → googleusercontent GET),
+    a következő hívásra az Apps Script {success, duplicate} választ ad.
+    """
+    if not EMAIL_WEBAPP_URL or not EMAIL_WEBAPP_SECRET:
+        log.error(f"[{tag}] EMAIL_WEBAPP_URL / EMAIL_WEBAPP_SECRET nincs beállítva")
+        return "hiba"
+
+    payload = dict(payload, secret=EMAIL_WEBAPP_SECRET, requestId=request_id)
+    utolso = ""
+    for kiserlet in range(1, EMAIL_KISERLETEK + 1):
+        if kiserlet > 1:
+            time.sleep(EMAIL_VARAKOZAS)
+        try:
+            r = requests.post(EMAIL_WEBAPP_URL, json=payload, timeout=(10, read_timeout))
+        except requests.RequestException as e:
+            utolso = f"hálózati hiba/timeout: {e}"
+            log.warning(f"[{tag}] {kiserlet}. kísérlet – {utolso}")
+            continue
+        try:
+            resp = r.json()
+            if not isinstance(resp, dict):
+                raise ValueError("a JSON nem objektum")
+        except ValueError:
+            utolso = f"nem JSON válasz (HTTP {r.status_code})"
+            log.warning(
+                f"[{tag}] {kiserlet}. kísérlet – {utolso}, "
+                f"Content-Type={r.headers.get('Content-Type', '')!r}, body={r.text[:300]!r}"
+            )
+            continue
         if resp.get("success"):
-            log.info(f"[EMAIL] Elküldve → {cimzett}" + (f" (Cc: {cc})" if cc else ""))
-            return True
-        else:
-            log.error(f"[EMAIL] Apps Script hiba: {resp}")
-            return False
-    except Exception as e:
-        log.error(f"[EMAIL] Küldési hiba: {e}")
-        return False
+            if resp.get("duplicate"):
+                log.info(f"[{tag}] Már korábban kiment (requestId={request_id}), nem küldtük újra")
+            return "ok"
+        log.error(f"[{tag}] Apps Script hiba: {resp}")
+        return "hiba"
+
+    log.error(f"[{tag}] {EMAIL_KISERLETEK} kísérlet után sincs értelmezhető válasz ({utolso}) – "
+              f"requestId={request_id}, ellenőrizd az Elküldött mappát")
+    return "bizonytalan"
+
+
+def email_kuld(cimzett: str, targy: str, html_body: str, cc: str = "",
+               request_id: str = "") -> bool:
+    """
+    HTML email a "sendEmail" actionnel. True = biztosan kiment.
+
+    request_id: ha megadod (determinisztikusan, pl. deal ID-ból), az Apps Script
+    6 órán belül ugyanarra az ID-ra nem küld újra — akkor sem, ha a hívó
+    később újrapróbálja. Ha üres, hívásonként egyedi ID generálódik: ez a
+    belső újrapróbálásokat védi, egy későbbi, kézi újraküldést nem blokkol.
+    """
+    if not request_id:
+        request_id = "e-" + uuid.uuid4().hex
+    payload = {
+        "action":   "sendEmail",
+        "to":       cimzett,
+        "subject":  targy,
+        "htmlBody": html_body,
+    }
+    if cc:
+        payload["cc"] = cc
+    eredmeny = _apps_script_email(payload, request_id, "EMAIL", read_timeout=25)
+    if eredmeny == "ok":
+        log.info(f"[EMAIL] Elküldve → {cimzett}" + (f" (Cc: {cc})" if cc else ""))
+        return True
+    return False
 
 
 # ─────────────────────────────────────────────
 # PDF ÁRAJÁNLAT EMAIL – deal üzletfelelősének, csatolmánnyal
-# Ugyanaz az ÖNÁLLÓ email-küldő Apps Script (EMAIL_WEBAPP_URL).
-# Az arajanlat_pdf.py importálja — ne nevezd át!
+# MEGJEGYZÉS: az arajanlat_pdf.py 2026-09-30 óta SAJÁT küldőt használ
+# (_apps_script_pdf_email), ezt a függvényt már nem importálja. Visszafelé
+# kompatibilitás miatt marad, a közös, újrapróbáló küldőn keresztül.
 # ─────────────────────────────────────────────
 def PDFquotationSENDdealOWNER(cimzett: str, targy: str, html_body: str,
                                attachment_b64: str, attachment_name: str,
-                               attachment_mime: str = "application/pdf") -> bool:
-    try:
-        r = requests.post(EMAIL_WEBAPP_URL, json={
-            "secret":             EMAIL_WEBAPP_SECRET,
-            "action":             "PDFquotationSENDdealOWNER",
-            "to":                 cimzett,
-            "subject":            targy,
-            "htmlBody":           html_body,
-            "attachmentBase64":   attachment_b64,
-            "attachmentName":     attachment_name,
-            "attachmentMimeType": attachment_mime,
-        }, timeout=60)
-        resp = r.json()
-        if resp.get("success"):
-            log.info(f"[PDF-EMAIL] Elküldve → {cimzett}")
-            return True
-        else:
-            log.error(f"[PDF-EMAIL] Apps Script hiba: {resp}")
-            return False
-    except Exception as e:
-        log.error(f"[PDF-EMAIL] Küldési hiba: {e}")
-        return False
+                               attachment_mime: str = "application/pdf",
+                               request_id: str = "") -> bool:
+    payload = {
+        "action":             "PDFquotationSENDdealOWNER",
+        "to":                 cimzett,
+        "subject":            targy,
+        "htmlBody":           html_body,
+        "attachmentBase64":   attachment_b64,
+        "attachmentName":     attachment_name,
+        "attachmentMimeType": attachment_mime,
+    }
+    eredmeny = _apps_script_email(payload, request_id or ("p-" + uuid.uuid4().hex),
+                                  "PDF-EMAIL", read_timeout=60)
+    if eredmeny == "ok":
+        log.info(f"[PDF-EMAIL] Elküldve → {cimzett}")
+        return True
+    return False
 
 
 # ─────────────────────────────────────────────
@@ -1163,7 +1223,8 @@ def pipedrive_webhook():
         if not owner_email:
             log.warning(f"[WEBHOOK] Nincs owner email a dealen ({deal_id}) — Cc kihagyva.")
 
-        siker = email_kuld(adatok["kapcsolattarto_email"], targy, email_html, cc=owner_email)
+        siker = email_kuld(adatok["kapcsolattarto_email"], targy, email_html, cc=owner_email,
+                           request_id=_kuldes_azonosito("won", deal_id))
         if siker:
             deal_ertesites_rogzit(deal_id, token, adatok["kapcsolattarto_email"])
             log.info(f"[WEBHOOK] Email elküldve: {adatok['kapcsolattarto_email']}" +
@@ -1242,7 +1303,14 @@ def visszajelzes_submit():
     o_html = owner_email_html(deal, idopontok, kovetelmenyek, megjegyzes,
                               alv_groups, alv_raw, helyszini_kapcsolattarto)
     o_targy = f"[Visszajelzés] {deal.get('cegnev','')} – {deal.get('bid_szam','')}"
-    owner_siker = email_kuld(deal.get("owner_email", ""), o_targy, o_html)
+    # Determinisztikus requestId-k: ha az ügyfél UGYANAZT újra beküldi (mert
+    # elveszett a válasz), az Apps Script 6 órán belül nem küld duplán.
+    # A beküldött tartalom is része az ID-nak → módosított adatokkal új levél megy.
+    vj_alap = _kuldes_azonosito("vj", token, json.dumps(
+        [idopontok, kovetelmenyek, megjegyzes, helyszini_kapcsolattarto],
+        sort_keys=True, ensure_ascii=False, default=str))
+    owner_siker = email_kuld(deal.get("owner_email", ""), o_targy, o_html,
+                             request_id=f"vj-owner-{vj_alap}")
 
     if not owner_siker:
         # Az ügyfél újra próbálkozhat — még semmi mást nem küldtünk ki.
@@ -1258,14 +1326,16 @@ def visszajelzes_submit():
                 kiv_nev, kiv_adat, helyszini_kapcsolattarto
             )
             kiv_targy = f"[{kiv_nev}] {deal.get('cegnev','')} – {deal.get('bid_szam','')}"
-            email_kuld(deal.get("owner_email", ""), kiv_targy, kiv_html)
+            email_kuld(deal.get("owner_email", ""), kiv_targy, kiv_html,
+                       request_id=f"vj-kiv-{vj_alap}-{_kuldes_azonosito(kiv_nev)[:10]}")
             log.info(f"[SUBMIT] Kivitelező email elküldve: {kiv_nev}")
 
     # ── Ügyfél visszaigazoló email ──
     u_html = ugyfel_visszaigazolo_html(deal, idopontok, kovetelmenyek, megjegyzes,
                                        helyszini_kapcsolattarto)
     u_targy = f"Visszajelzés visszaigazolása – {deal.get('bid_szam','')} | SQM Hungary"
-    email_kuld(deal.get("kapcsolattarto_email", ""), u_targy, u_html)
+    email_kuld(deal.get("kapcsolattarto_email", ""), u_targy, u_html,
+               request_id=f"vj-ugyfel-{vj_alap}")
 
     # ── Visszajelzés naplózása a Pipedrive dealen (note) ──
     try:
@@ -1309,7 +1379,11 @@ def send_alv_email():
     if not targy:
         return jsonify({"ok": False, "hiba": "Hiányzó tárgy"}), 400
 
-    siker = email_kuld(cimzett, targy, html_body, cc=cc)
+    # Opcionális: ha a kalkulátor küld "idempotencyKey"-t (gombnyomásonként egyet),
+    # akkor a dupla kattintás/újraküldés sem megy ki kétszer.
+    kulcs = (adat.get("idempotencyKey") or "").strip()
+    siker = email_kuld(cimzett, targy, html_body, cc=cc,
+                       request_id=f"alv-{_kuldes_azonosito(kulcs)}" if kulcs else "")
     if not siker:
         return jsonify({"ok": False, "hiba": "Email küldés sikertelen (lásd Railway log)"}), 502
     return jsonify({"ok": True}), 200
@@ -1338,7 +1412,11 @@ def send_arbekero_email():
     except FileNotFoundError:
         return jsonify({"ok": False, "hiba": "Hiányzó sablon: sablonok/alvallalkozoi_arbekero.html"}), 500
 
-    siker = email_kuld(cimzett, targy, html_body)
+    # "requestId" itt az SQM projektazonosító (tárgyban szerepel) — a
+    # duplikációszűréshez külön "idempotencyKey" mező szolgál (opcionális).
+    kulcs = (adat.get("idempotencyKey") or "").strip()
+    siker = email_kuld(cimzett, targy, html_body,
+                       request_id=f"arb-{_kuldes_azonosito(kulcs)}" if kulcs else "")
     if not siker:
         return jsonify({"ok": False, "hiba": "Email küldés sikertelen (lásd Railway log)"}), 502
     return jsonify({"ok": True}), 200
