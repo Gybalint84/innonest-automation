@@ -171,8 +171,23 @@ def _uzenet(d: dict) -> str:
     if tetel_nev:
         m = f" — {menny} {egyseg}".rstrip() if menny not in (None, "") else ""
         sorok.append(f"Tétel: {tetel_nev}{m}")
+    # 2026-09-30: a webappban ki/be kapcsolható, hogy az anyagok nevesítve
+    # szerepeljenek-e a szövegben (anyagokBele: True / False; hiányzik = régi mód).
+    anyagok_bele = d.get("anyagokBele")
     if retegek:
         sorok.append("A rétegrend / felhasznált anyagok: " + "; ".join(retegek))
+    if anyagok_bele is True and retegek:
+        sorok.append(
+            "FELHASZNÁLT ANYAGOK: a szövegben nevezd meg a fenti felhasznált anyagokat "
+            "(termék- vagy rendszernév szerint), természetesen, a mondatokba építve — ne "
+            "felsorolásként. Rövid (TERC) módban is szerepeljenek, tömören."
+        )
+    elif anyagok_bele is False:
+        sorok.append(
+            "FELHASZNÁLT ANYAGOK: NE nevezz meg konkrét anyag-, termék- vagy márkanevet a "
+            "szövegben; általános megnevezést használj (pl. „epoxi rendszeranyagok”, "
+            "„alapozó”, „fedőréteg”)."
+        )
     if korulm:
         sorok.append("Projekt-körülmények: " + "; ".join(korulm))
     if jegyzet:
