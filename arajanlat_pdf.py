@@ -37,12 +37,17 @@ from flask import request, jsonify, Response, redirect
 from playwright.async_api import async_playwright
 
 from innonest_core import login, load_session, make_browser_args, _loop, upload_csatolmany
-from pipedrive_addon import PDFquotationSENDdealOWNER
 
 log = logging.getLogger(__name__)
 
 PIPEDRIVE_API_TOKEN = os.environ.get("PIPEDRIVE_API_TOKEN", "")
 PDF_TOOL_SECRET     = os.environ.get("PDF_TOOL_SECRET", "")
+
+# "SQM Email Küldő" Apps Script web app (webapp_email_v1.js)
+EMAIL_WEBAPP_URL    = os.environ.get("EMAIL_WEBAPP_URL", "")
+EMAIL_WEBAPP_SECRET = os.environ.get("EMAIL_WEBAPP_SECRET", "")
+PDF_EMAIL_KISERLETEK = 3      # összes próbálkozás (idempotens: requestId alapján)
+PDF_EMAIL_VARAKOZAS  = 5      # mp két próbálkozás között
 
 
 def _pdf_tool_auth_ok(req) -> bool:
@@ -855,7 +860,75 @@ def _text_to_email_html(text: str) -> str:
     """
 
 
-def _send_pdf_email_custom(adatok: dict, pdf_path: str, custom_message: str) -> dict:
+def _apps_script_pdf_email(to: str, subject: str, html_body: str,
+                           pdf_b64: str, filename: str, request_id: str) -> dict:
+    """
+    PDF-es email küldése az "SQM Email Küldő" Apps Scripten keresztül.
+
+    Visszatérés: {"eredmeny": "ok" | "hiba" | "bizonytalan", "uzenet": str}
+      ok          – az Apps Script JSON-ban megerősítette a küldést
+      hiba        – az Apps Script JSON-ban hibát jelzett (biztosan NEM ment ki)
+      bizonytalan – egyik próbálkozásra sem jött értelmezhető válasz
+
+    A requestId miatt az újrapróbálás biztonságos: ha az első hívás már
+    kiküldte a levelet, csak a válasz veszett el (302 → googleusercontent
+    GET akadás), az Apps Script a második hívásra duplikátumként "success"-t
+    ad vissza, és NEM küld újra.
+    """
+    if not EMAIL_WEBAPP_URL or not EMAIL_WEBAPP_SECRET:
+        return {"eredmeny": "hiba", "uzenet": "EMAIL_WEBAPP_URL / EMAIL_WEBAPP_SECRET nincs beállítva"}
+
+    payload = {
+        "secret": EMAIL_WEBAPP_SECRET,
+        "action": "PDFquotationSENDdealOWNER",
+        "requestId": request_id,
+        "to": to,
+        "subject": subject,
+        "htmlBody": html_body,
+        "attachmentBase64": pdf_b64,
+        "attachmentName": filename,
+        "attachmentMimeType": "application/pdf",
+    }
+
+    utolso_ok = ""
+    for kiserlet in range(1, PDF_EMAIL_KISERLETEK + 1):
+        if kiserlet > 1:
+            time.sleep(PDF_EMAIL_VARAKOZAS)
+        try:
+            r = requests.post(EMAIL_WEBAPP_URL, json=payload, timeout=(10, 60))
+        except requests.RequestException as e:
+            utolso_ok = f"hálózati hiba: {e}"
+            log.warning(f"[PDF-EMAIL] {kiserlet}. kísérlet – {utolso_ok}")
+            continue
+
+        try:
+            data = r.json()
+            if not isinstance(data, dict):
+                raise ValueError("a JSON nem objektum")
+        except ValueError:
+            utolso_ok = f"nem JSON válasz (HTTP {r.status_code})"
+            log.warning(
+                f"[PDF-EMAIL] {kiserlet}. kísérlet – {utolso_ok}, "
+                f"Content-Type={r.headers.get('Content-Type', '')!r}, "
+                f"body={r.text[:300]!r}"
+            )
+            continue
+
+        if data.get("success"):
+            if data.get("duplicate"):
+                log.info(f"[PDF-EMAIL] Már korábban kiment (requestId={request_id}), nem küldtük újra")
+            log.info(f"[PDF-EMAIL] Elküldve → {to} ({kiserlet}. kísérlet)")
+            return {"eredmeny": "ok", "uzenet": data.get("message", "")}
+
+        hiba = data.get("error") or "ismeretlen hiba"
+        log.error(f"[PDF-EMAIL] Apps Script hibát jelzett: {hiba}")
+        return {"eredmeny": "hiba", "uzenet": hiba}
+
+    log.error(f"[PDF-EMAIL] {PDF_EMAIL_KISERLETEK} kísérlet után sincs értelmezhető válasz ({utolso_ok})")
+    return {"eredmeny": "bizonytalan", "uzenet": utolso_ok}
+
+
+def _send_pdf_email_custom(adatok: dict, pdf_path: str, custom_message: str, request_id: str) -> dict:
     """Egyedi szöveggel küld email a deal üzletfelelősének, PDF csatolmánnyal."""
     info = _find_open_deal_owner_by_cegnev(adatok.get("ugyfel_nev", ""))
     if not info.get("found"):
@@ -870,18 +943,22 @@ def _send_pdf_email_custom(adatok: dict, pdf_path: str, custom_message: str) -> 
 
     filename = _pdf_filename(adatok.get("bid_szam", "arajanlat"), adatok.get("ugyfel_nev", ""))
 
-    ok = PDFquotationSENDdealOWNER(
-        info["owner_email"], subject, html_body,
-        attachment_b64=pdf_b64,
-        attachment_name=filename,
-        attachment_mime="application/pdf",
-    )
+    res = _apps_script_pdf_email(info["owner_email"], subject, html_body, pdf_b64, filename, request_id)
 
-    if ok:
+    if res["eredmeny"] == "ok":
         log.info(f"[PDF] Email elküldve: {info['owner_email']}")
         return {"success": True, "owner_email": info["owner_email"], "owner_name": info["owner_name"]}
-    else:
-        return {"success": False, "message": "Email küldés sikertelen (Apps Script hiba)"}
+    if res["eredmeny"] == "bizonytalan":
+        return {
+            "success": False,
+            "bizonytalan": True,
+            "owner_email": info["owner_email"],
+            "message": (
+                "Nem jött visszaigazolás az email-küldésről – lehet, hogy kiment. "
+                "Ellenőrizd az info@ Elküldött mappáját, mielőtt újraküldöd."
+            ),
+        }
+    return {"success": False, "message": f"Email küldés sikertelen: {res['uzenet']}"}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -992,7 +1069,8 @@ async def _run_phase2(job_id: str, custom_message: str):
 
     # Email küldés
     _set_job(job_id, status="sending_email", message="Email küldése az értékesítőnek...")
-    email_result = _send_pdf_email_custom(adatok, pdf_path, custom_message)
+    # job_id = requestId → az Apps Script ez alapján szűri a duplikált küldést
+    email_result = _send_pdf_email_custom(adatok, pdf_path, custom_message, request_id=job_id)
 
     # ── Webapp polling visszajelzés ──────────────────────────────────────────
     # Ha az email sikeresen elment, tároljuk a proj_id → dátum párost.
@@ -1024,6 +1102,8 @@ async def _run_phase2(job_id: str, custom_message: str):
                 await browser.close()
         except Exception as e:
             log.warning(f"[PDF] Státusz változtatás hiba (nem kritikus): {e}")
+    elif email_result.get("bizonytalan"):
+        log.warning(f"[PDF] Státusz változtatás kihagyva (email státusza bizonytalan – ellenőrizd az Elküldött mappát): {bid}")
     else:
         log.info(f"[PDF] Státusz változtatás kihagyva (email sikertelen): {bid}")
 
