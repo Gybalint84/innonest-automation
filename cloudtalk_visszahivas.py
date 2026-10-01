@@ -1,36 +1,32 @@
 """
 cloudtalk_visszahivas.py – Nem fogadott CloudTalk hívás → Pipedrive "Visszahívás" tevékenység
 ==============================================================================================
-A CloudTalk Workflow Automation (Trigger: Call > Ended, feltétel: direction = incoming,
-talking_time = 0) API Request akciója POST-ol ide. A modul:
+EGY általános CloudTalk Workflow Automation (Trigger: Call > Ended, feltétel: direction =
+incoming, talking_time = 0 – számra szűrés NEM kell) API Request akciója POST-ol ide.
+
+A modul a háttérben:
   1. ellenőrzi a titkos kulcsot (X-SQM-Secret header VAGY "secret" mező a bodyban),
   2. call_uuid alapján kiszűri a duplikált hívásokat,
-  3. telefonszám alapján megkeresi a személyt Pipedrive-ban (+ cég, + legutóbbi nyitott deal),
-  4. létrehoz egy "call" típusú, mai határidős tevékenységet, vagy ha ugyanarról a számról
+  3. a CloudTalk Analytics API-ból (call_id alapján) lekéri a hívás lépéseit (call_steps),
+     és kiolvassa, melyik AGENTNÉL csengett ki a hívás → ő lesz a felelős,
+     (CloudTalk agent → Pipedrive user: e-mail, majd ékezet/sorrend-független név alapján)
+  4. ha ez nem sikerül: SZAM_FELELOS (hívott szám → név) → CLOUDTALK_VISSZAHIVAS_USER_ID,
+  5. telefonszám alapján megkeresi a hívót Pipedrive-ban (+ cég, + legutóbbi nyitott deal),
+  6. "call" típusú, mai határidős tevékenységet hoz létre, vagy ha ugyanarról a számról
      ma már van nyitott visszahívás-tevékenység, azt frissíti ("2x hívott").
 
-Végpont: POST /cloudtalk-visszahivas
+Végpont: POST /cloudtalk-visszahivas   (azonnal 202-vel válaszol, a munka háttérszálon fut)
 
 Környezeti változók (Railway → Variables):
   PIPEDRIVE_API_TOKEN            – (meglévő) Pipedrive API token
-  CLOUDTALK_WEBHOOK_SECRET       – új, tetszőleges hosszú véletlen string
-  CLOUDTALK_VISSZAHIVAS_USER_ID  – opcionális: Pipedrive user ID, akihez a tevékenység kerül
-                                   (üresen a token tulajdonosához kerül)
-  CLOUDTALK_SZAM_FELELOS         – opcionális JSON, a kódba írt SZAM_FELELOS_ALAP-ot
-                                   egészíti ki / írja felül: belső szám → Pipedrive user
-                                   neve VAGY ID-ja, pl. {"+3612345678": "Kiss Anna"}
-
-Felelős kiválasztása: a HÍVOTT SQM szám (internal_number) alapján. A név alapján a
-Pipedrive felhasználók közül keresi ki az ID-t (ékezet- és sorrendfüggetlenül, tehát
-"Dudás Mária" = "Maria Dudas"). Ha nincs egyezés → CLOUDTALK_VISSZAHIVAS_USER_ID.
+  CLOUDTALK_WEBHOOK_SECRET       – a CloudTalk X-SQM-Secret headerében küldött kulcs
+  CLOUDTALK_API_KEY_ID           – CloudTalk → Account → Settings → API Keys → ID
+  CLOUDTALK_API_KEY_SECRET       – ugyanott: Key (secret)
+  CLOUDTALK_VISSZAHIVAS_USER_ID  – opcionális: végső tartalék Pipedrive user ID
+  CLOUDTALK_SZAM_FELELOS         – opcionális JSON tartalék-térkép: hívott szám → név/ID
 
 CloudTalk API Request "Values" (Key → Value, a Value-t a jobb oldali listából kattintva):
-  secret          → <CLOUDTALK_WEBHOOK_SECRET értéke>
-  external_number → {{ event.properties.external_number }}
-  internal_number → {{ event.properties.internal_number }}
-  call_uuid       → {{ event.properties.call_uuid }}
-  started_at      → {{ event.properties.started_at }}
-  waiting_time    → {{ event.properties.waiting_time }}
+  call_id, call_uuid, external_number, internal_number, started_at, waiting_time
 """
 import os
 import re
@@ -50,11 +46,20 @@ log = logging.getLogger(__name__)
 PIPEDRIVE_API_TOKEN = os.environ.get("PIPEDRIVE_API_TOKEN", "")
 CLOUDTALK_WEBHOOK_SECRET = os.environ.get("CLOUDTALK_WEBHOOK_SECRET", "")
 ALAP_USER_ID = os.environ.get("CLOUDTALK_VISSZAHIVAS_USER_ID", "").strip()
+CT_KEY_ID = os.environ.get("CLOUDTALK_API_KEY_ID", "")
+CT_KEY_SECRET = os.environ.get("CLOUDTALK_API_KEY_SECRET", "")
+CT_ANALYTICS = "https://analytics-api.cloudtalk.io/api"
+CT_CORE = "https://my.cloudtalk.io/api"
+# A hívás vége után az Analytics adat néhány mp késéssel áll elő → ennyit várunk próbánként
+CT_RETRY_DELAYS = [3, 7, 15, 30]
+PD_RETRY_DELAYS = [0, 5, 20]
 
-# Hívott SQM szám → felelős (Pipedrive user neve vagy ID-ja)
+# TARTALÉK: hívott SQM szám → felelős, ha a CloudTalk call_steps nem ad agentet
+# (pl. API-hiba, átirányított hívás). Név vagy Pipedrive user ID.
 SZAM_FELELOS_ALAP = {
     "+3619991661": "Dudás Mária",
     "+36202106309": "Dudás Mária",
+    "+3614088582": "Kanozsai Vivien",
 }
 
 try:
@@ -247,18 +252,130 @@ def user_id_nev_alapjan(nev: str) -> int | None:
     return None
 
 
-def felelos_user(internal_e164: str) -> int | None:
+def tartalek_felelos(internal_e164: str) -> tuple[int | None, str]:
+    """SZAM_FELELOS térkép, majd CLOUDTALK_VISSZAHIVAS_USER_ID. → (user_id, forrás)"""
     cel = _utolso9(internal_e164)
     if cel:
         for k, v in SZAM_FELELOS.items():
             if _utolso9(k) == cel:
                 if isinstance(v, int) or str(v).strip().isdigit():
-                    return int(v)
+                    return int(v), "számtérkép"
                 uid = user_id_nev_alapjan(str(v))
                 if uid:
-                    return uid
-                break  # név nem található → alapértelmezett felelős
-    return int(ALAP_USER_ID) if ALAP_USER_ID.isdigit() else None
+                    return uid, "számtérkép"
+                break
+    if ALAP_USER_ID.isdigit():
+        return int(ALAP_USER_ID), "alapértelmezett"
+    return None, "nincs (token tulajdonosa)"
+
+
+# ── CloudTalk ─────────────────────────────────────────────────────────────────
+_ct_agent_cache: dict = {"ido": 0.0, "agentek": {}}
+
+
+def _ct_get(url: str, params: dict | None = None):
+    if not (CT_KEY_ID and CT_KEY_SECRET):
+        log.warning("[CT] CLOUDTALK_API_KEY_ID / _SECRET nincs beállítva – call_steps kihagyva")
+        return None
+    try:
+        r = requests.get(url, params=params, auth=(CT_KEY_ID, CT_KEY_SECRET), timeout=15)
+        if r.status_code == 404:
+            return None  # még nincs feldolgozva / nem létezik
+        if r.status_code != 200:
+            log.error(f"[CT] GET {url} → HTTP {r.status_code}: {r.text[:200]}")
+            return None
+        return r.json()
+    except Exception as e:
+        log.error(f"[CT] GET {url}: {e}")
+        return None
+
+
+def ct_hivas_reszletek(call_id: str) -> dict | None:
+    """Analytics API: hívás részletei call_steps-szel. Újrapróbál, amíg az agent-lépés meg
+    nem jelenik (a Call ended esemény után az adat pár mp késéssel áll elő)."""
+    if not str(call_id or "").strip().isdigit():
+        return None
+    if not (CT_KEY_ID and CT_KEY_SECRET):
+        log.warning("[CT] CLOUDTALK_API_KEY_ID / _SECRET nincs beállítva – tartalék felelős-logika")
+        return None
+    utolso = None
+    for varakozas in CT_RETRY_DELAYS:
+        time.sleep(varakozas)
+        data = _ct_get(f"{CT_ANALYTICS}/calls/{call_id}")
+        if isinstance(data, dict) and isinstance(data.get("responseData"), dict):
+            data = data["responseData"]
+        if isinstance(data, dict) and data:
+            utolso = data
+            if any(l.get("type") == "agent" for l in data.get("call_steps") or []):
+                return data
+    if utolso is None:
+        log.warning(f"[CT] Nem sikerült lekérni a hívás részleteit (call_id={call_id})")
+    return utolso
+
+
+def kicsengetett_agentek(reszletek: dict | None) -> list[dict]:
+    """[{id, name, reason}] a call_steps agent-lépéseiből, sorrendben, ismétlés nélkül."""
+    out, seen = [], set()
+    for lepes in (reszletek or {}).get("call_steps") or []:
+        if lepes.get("type") != "agent" or not lepes.get("id") or lepes["id"] in seen:
+            continue
+        seen.add(lepes["id"])
+        out.append({"id": lepes["id"], "name": lepes.get("name") or "", "reason": lepes.get("reason") or ""})
+    return out
+
+
+def hangposta_hagyva(reszletek: dict | None) -> int:
+    """Hagyott-e hangüzenetet: a voicemail-lépés hossza mp-ben (0 = nem)."""
+    for lepes in (reszletek or {}).get("call_steps") or []:
+        if lepes.get("type") == "voicemail" and str(lepes.get("status")).upper() == "SUCCESS":
+            try:
+                return max(int(lepes.get("total_time") or 0), 1)
+            except (TypeError, ValueError):
+                return 1
+    return 0
+
+
+def _ct_agentek() -> dict:
+    """CloudTalk agentek id → {nev, email}, 1 órás cache-sel."""
+    with _lock:
+        if _ct_agent_cache["agentek"] and time.time() - _ct_agent_cache["ido"] < 3600:
+            return _ct_agent_cache["agentek"]
+    data = _ct_get(f"{CT_CORE}/agents/index.json", {"limit": 1000}) or {}
+    agentek = {}
+    for elem in ((data.get("responseData") or {}).get("data") or []):
+        a = elem.get("Agent") or elem
+        if a.get("id"):
+            agentek[int(a["id"])] = {
+                "nev": f'{a.get("firstname", "")} {a.get("lastname", "")}'.strip(),
+                "email": (a.get("email") or "").strip().lower(),
+            }
+    if agentek:
+        with _lock:
+            _ct_agent_cache.update(ido=time.time(), agentek=agentek)
+    return agentek
+
+
+def pipedrive_user_agenthez(agent: dict) -> int | None:
+    """CloudTalk agent → Pipedrive user ID: előbb e-mail, aztán név alapján."""
+    info = _ct_agentek().get(int(agent["id"]), {})
+    email = info.get("email", "")
+    userek = _pipedrive_userek()
+    if email:
+        for u in userek:
+            if (u.get("email") or "").strip().lower() == email:
+                return u.get("id")
+    for nev in (agent.get("name"), info.get("nev")):
+        kulcs = _nev_kulcs(nev)
+        if kulcs:
+            for u in userek:
+                if _nev_kulcs(u.get("name")) == kulcs:
+                    return u.get("id")
+    log.warning(f"[CT] Nincs Pipedrive user a CloudTalk agenthez: {agent.get('name')!r} ({email})")
+    return None
+
+
+OK_SZOVEG = {"not_picked_up": "nem vette fel", "busy": "foglalt volt", "rejected": "elutasította",
+             "unavailable": "nem volt elérhető", "offline": "offline volt"}
 
 
 # ── Fő logika ─────────────────────────────────────────────────────────────────
@@ -267,21 +384,35 @@ def _takarit(most: float):
         del _feldolgozott_hivasok[k]
 
 
-def feldolgoz(adat: dict) -> dict:
+def lefoglal(adat: dict) -> bool:
+    """True, ha ezt a hívást még nem dolgoztuk fel (és lefoglalja)."""
+    call_uuid = str(adat.get("call_uuid") or adat.get("call_id") or "").strip()
+    if not call_uuid:
+        return True
     most = time.time()
-    call_uuid = str(adat.get("call_uuid") or "").strip()
-
     with _lock:
         _takarit(most)
-        if call_uuid and call_uuid in _feldolgozott_hivasok:
-            return {"status": "duplikalt", "call_uuid": call_uuid}
-        if call_uuid:
-            _feldolgozott_hivasok[call_uuid] = most
+        if call_uuid in _feldolgozott_hivasok:
+            return False
+        _feldolgozott_hivasok[call_uuid] = most
+    return True
 
+
+def _pd_ujraprobal(method: str, endpoint: str, payload: dict):
+    for varakozas in PD_RETRY_DELAYS:
+        time.sleep(varakozas)
+        eredmeny = _pd(method, endpoint, payload=payload)
+        if eredmeny:
+            return eredmeny
+    return None
+
+
+def feldolgoz(adat: dict) -> dict:
+    call_uuid = str(adat.get("call_uuid") or "").strip()
+    call_id = str(adat.get("call_id") or "").strip()
     kulso = normalizal_szam(adat.get("external_number"))
     belso = normalizal_szam(adat.get("internal_number"))
-    hivas_utc = _parse_utc(adat.get("started_at")) or datetime.now(timezone.utc)
-    hivas_hu = budapest_ido(hivas_utc)
+    hivas_hu = budapest_ido(_parse_utc(adat.get("started_at")) or datetime.now(timezone.utc))
     ma = budapest_ido(datetime.now(timezone.utc)).strftime("%Y-%m-%d")
     ido_str = hivas_hu.strftime("%Y.%m.%d. %H:%M")
     try:
@@ -289,7 +420,27 @@ def feldolgoz(adat: dict) -> dict:
     except (TypeError, ValueError):
         varakozas = 0
 
-    # Ugyanarról a számról ma már van nyitott tevékenység? → frissítjük
+    # ── 1. Kinél csengett? (CloudTalk call_steps) ────────────────────────────
+    reszletek = ct_hivas_reszletek(call_id)
+    if reszletek and str(reszletek.get("status") or "").lower() == "answered":
+        log.info(f"[CT] call_id={call_id} közben fogadottnak látszik – kihagyva")
+        return {"status": "kihagyva", "ok": "fogadott hívás"}
+    if reszletek and not belso:
+        belso = normalizal_szam((reszletek.get("internal_number") or {}).get("number"))
+    agentek = kicsengetett_agentek(reszletek)
+    hangposta = hangposta_hagyva(reszletek)
+
+    user_id, forras = None, ""
+    for ag in agentek:  # az első olyan agent, akihez van Pipedrive user
+        user_id = pipedrive_user_agenthez(ag)
+        if user_id:
+            forras = f"CloudTalk: {ag['name']}"
+            break
+    if not user_id:
+        user_id, forras = tartalek_felelos(belso)
+    log.info(f"[CT] Felelős: user_id={user_id} ({forras})")
+
+    # ── 2. Ugyanarról a számról ma már van nyitott tevékenység? → frissítés ──
     if kulso:
         with _lock:
             korabbi = _mai_tevekenysegek.get(kulso)
@@ -299,13 +450,15 @@ def feldolgoz(adat: dict) -> dict:
             if akt and not akt.get("done"):
                 uj_db = db + 1
                 targy = re.sub(r" \(\d+x hívott\)$", "", akt.get("subject") or "") + f" ({uj_db}x hívott)"
-                jegyzet = (akt.get("note") or "") + f"<br>• Újabb nem fogadott hívás: {ido_str}"
+                jegyzet = (akt.get("note") or "") + f"<br>• Újabb nem fogadott hívás: {ido_str}" + \
+                    (f" (hangüzenetet hagyott, {hangposta} mp)" if hangposta else "")
                 if _pd("PATCH", f"activities/{act_id}", payload={"subject": targy, "note": jegyzet}):
                     with _lock:
                         _mai_tevekenysegek[kulso] = (act_id, ma, uj_db)
                     log.info(f"[CT] Tevékenység frissítve #{act_id} ({kulso}, {uj_db}x)")
                     return {"status": "frissitve", "activity_id": act_id}
 
+    # ── 3. Hívó keresése Pipedrive-ban ───────────────────────────────────────
     szemely = szemely_keresese(kulso) if kulso else None
     deal = nyitott_deal(szemely["person_id"]) if szemely else None
 
@@ -314,6 +467,8 @@ def feldolgoz(adat: dict) -> dict:
     else:
         ki = " – ".join(x for x in [(szemely or {}).get("ceg"), (szemely or {}).get("nev")] if x)
         targy = f"{TARGY_PREFIX}: {megjelenitett_szam(kulso)}" + (f" ({ki})" if ki else "")
+    if hangposta:
+        targy += " 🎙️"
 
     sorok = [
         f"<b>Nem fogadott bejövő hívás</b> – {ido_str}",
@@ -321,23 +476,23 @@ def feldolgoz(adat: dict) -> dict:
     ]
     if belso:
         sorok.append(f"Hívott SQM szám: {megjelenitett_szam(belso)}")
+    if agentek:
+        sorok.append("Kicsengetett: " + ", ".join(
+            html.escape(a["name"]) + (f" ({OK_SZOVEG.get(a['reason'], a['reason'])})" if a["reason"] else "")
+            for a in agentek))
     if varakozas:
         sorok.append(f"Kicsengetési idő: {varakozas} mp")
+    if hangposta:
+        sorok.append(f"<b>Hangüzenetet hagyott</b> ({hangposta} mp) – meghallgatható a CloudTalkban")
     if not szemely and kulso:
         sorok.append("<i>Ismeretlen szám – nincs hozzá Pipedrive kontakt.</i>")
     if deal:
         sorok.append(f"Kapcsolt nyitott deal: {html.escape(deal['cim'])}")
-    if call_uuid:
-        sorok.append(f"<small>CloudTalk call_uuid: {call_uuid}</small>")
+    if call_id or call_uuid:
+        sorok.append(f"<small>CloudTalk call_id: {call_id or '-'} / {call_uuid or '-'}</small>")
 
-    payload = {
-        "subject": targy,
-        "type": "call",
-        "due_date": ma,
-        "done": False,
-        "note": "<br>".join(sorok),
-    }
-    user_id = felelos_user(belso)
+    payload = {"subject": targy, "type": "call", "due_date": ma, "done": False,
+               "note": "<br>".join(sorok)}
     if user_id:
         payload["owner_id"] = user_id
     if szemely:
@@ -347,19 +502,23 @@ def feldolgoz(adat: dict) -> dict:
     if deal:
         payload["deal_id"] = deal["id"]
 
-    uj = _pd("POST", "activities", payload=payload)
+    uj = _pd_ujraprobal("POST", "activities", payload)
     if not uj:
-        # Hogy egy CloudTalk újrapróbálkozás ne vesszen el
-        with _lock:
-            _feldolgozott_hivasok.pop(call_uuid, None)
-        return {"status": "hiba", "uzenet": "Pipedrive tevékenység létrehozása sikertelen"}
-
+        log.error(f"[CT] Tevékenység létrehozása VÉGLEG sikertelen – {kulso} {ido_str} (call_id={call_id})")
+        return {"status": "hiba"}
     if kulso:
         with _lock:
             _mai_tevekenysegek[kulso] = (uj.get("id"), ma, 1)
-    log.info(f"[CT] Visszahívás-tevékenység #{uj.get('id')} – {kulso or 'rejtett'}")
-    return {"status": "letrehozva", "activity_id": uj.get("id"),
+    log.info(f"[CT] Visszahívás-tevékenység #{uj.get('id')} – {kulso or 'rejtett'} → user {user_id}")
+    return {"status": "letrehozva", "activity_id": uj.get("id"), "owner_id": user_id,
             "person_id": (szemely or {}).get("person_id"), "deal_id": (deal or {}).get("id")}
+
+
+def _hatterben(adat: dict):
+    try:
+        feldolgoz(adat)
+    except Exception as e:
+        log.exception(f"[CT] Feldolgozási hiba: {e}")
 
 
 # ── Route ─────────────────────────────────────────────────────────────────────
@@ -374,6 +533,7 @@ def register_cloudtalk_routes(app):
             log.warning("[CT] Jogosulatlan hívás a /cloudtalk-visszahivas végpontra")
             return jsonify({"error": "Unauthorized"}), 401
         log.info(f"[CT] Beérkezett: { {k: v for k, v in adat.items() if k != 'secret'} }")
-        eredmeny = feldolgoz(adat)
-        kod = 500 if eredmeny.get("status") == "hiba" else 200
-        return jsonify(eredmeny), kod
+        if not lefoglal(adat):
+            return jsonify({"status": "duplikalt"}), 200
+        threading.Thread(target=_hatterben, args=(adat,), daemon=True).start()
+        return jsonify({"status": "elfogadva"}), 202
