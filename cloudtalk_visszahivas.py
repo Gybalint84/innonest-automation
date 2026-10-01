@@ -16,8 +16,13 @@ Környezeti változók (Railway → Variables):
   CLOUDTALK_WEBHOOK_SECRET       – új, tetszőleges hosszú véletlen string
   CLOUDTALK_VISSZAHIVAS_USER_ID  – opcionális: Pipedrive user ID, akihez a tevékenység kerül
                                    (üresen a token tulajdonosához kerül)
-  CLOUDTALK_SZAM_FELELOS         – opcionális JSON: belső szám → Pipedrive user ID,
-                                   pl. {"+3612345678": 1234567, "+36301112222": 7654321}
+  CLOUDTALK_SZAM_FELELOS         – opcionális JSON, a kódba írt SZAM_FELELOS_ALAP-ot
+                                   egészíti ki / írja felül: belső szám → Pipedrive user
+                                   neve VAGY ID-ja, pl. {"+3612345678": "Kiss Anna"}
+
+Felelős kiválasztása: a HÍVOTT SQM szám (internal_number) alapján. A név alapján a
+Pipedrive felhasználók közül keresi ki az ID-t (ékezet- és sorrendfüggetlenül, tehát
+"Dudás Mária" = "Maria Dudas"). Ha nincs egyezés → CLOUDTALK_VISSZAHIVAS_USER_ID.
 
 CloudTalk API Request "Values" (Key → Value, a Value-t a jobb oldali listából kattintva):
   secret          → <CLOUDTALK_WEBHOOK_SECRET értéke>
@@ -34,6 +39,7 @@ import json
 import time
 import logging
 import threading
+import unicodedata
 from datetime import datetime, timedelta, timezone
 
 import requests
@@ -45,11 +51,18 @@ PIPEDRIVE_API_TOKEN = os.environ.get("PIPEDRIVE_API_TOKEN", "")
 CLOUDTALK_WEBHOOK_SECRET = os.environ.get("CLOUDTALK_WEBHOOK_SECRET", "")
 ALAP_USER_ID = os.environ.get("CLOUDTALK_VISSZAHIVAS_USER_ID", "").strip()
 
+# Hívott SQM szám → felelős (Pipedrive user neve vagy ID-ja)
+SZAM_FELELOS_ALAP = {
+    "+3619991661": "Dudás Mária",
+    "+36202106309": "Dudás Mária",
+}
+
 try:
-    SZAM_FELELOS = json.loads(os.environ.get("CLOUDTALK_SZAM_FELELOS", "") or "{}")
+    _env_map = json.loads(os.environ.get("CLOUDTALK_SZAM_FELELOS", "") or "{}")
 except Exception:
     log.error("[CT] CLOUDTALK_SZAM_FELELOS nem érvényes JSON – figyelmen kívül hagyva")
-    SZAM_FELELOS = {}
+    _env_map = {}
+SZAM_FELELOS = {**SZAM_FELELOS_ALAP, **(_env_map if isinstance(_env_map, dict) else {})}
 
 PD_BASE = "https://api.pipedrive.com/api/v2"   # v1 aug. 1. óta out-of-support
 TARGY_PREFIX = "📞 Visszahívás"
@@ -193,10 +206,58 @@ def nyitott_deal(person_id: int) -> dict | None:
     return None
 
 
+_user_cache: dict = {"ido": 0.0, "userek": []}
+
+
+def _nev_kulcs(nev: str) -> tuple:
+    """Ékezet- és sorrendfüggetlen összehasonlító kulcs: 'Dudás Mária' = 'Maria Dudas'."""
+    tiszta = unicodedata.normalize("NFKD", str(nev or "")).encode("ascii", "ignore").decode()
+    return tuple(sorted(re.findall(r"[a-z]+", tiszta.lower())))
+
+
+def _pipedrive_userek() -> list:
+    """Aktív Pipedrive felhasználók, 1 órás cache-sel. (A /v1/users nincs a kivezetett
+    végpontok között, ezért itt v1-et használunk.)"""
+    with _lock:
+        if _user_cache["userek"] and time.time() - _user_cache["ido"] < 3600:
+            return _user_cache["userek"]
+    try:
+        r = requests.get("https://api.pipedrive.com/v1/users",
+                         params={"api_token": PIPEDRIVE_API_TOKEN}, timeout=15)
+        data = r.json()
+        userek = [u for u in (data.get("data") or []) if u.get("active_flag", True)] \
+            if data.get("success") else []
+    except Exception as e:
+        log.error(f"[CT→PD] users lekérés: {e}")
+        userek = []
+    if userek:
+        with _lock:
+            _user_cache.update(ido=time.time(), userek=userek)
+    return userek
+
+
+def user_id_nev_alapjan(nev: str) -> int | None:
+    kulcs = _nev_kulcs(nev)
+    if not kulcs:
+        return None
+    for u in _pipedrive_userek():
+        if _nev_kulcs(u.get("name")) == kulcs:
+            return u.get("id")
+    log.warning(f"[CT] Nincs ilyen nevű aktív Pipedrive user: {nev!r}")
+    return None
+
+
 def felelos_user(internal_e164: str) -> int | None:
-    for k, v in SZAM_FELELOS.items():
-        if _utolso9(k) == _utolso9(internal_e164) and _utolso9(k):
-            return int(v)
+    cel = _utolso9(internal_e164)
+    if cel:
+        for k, v in SZAM_FELELOS.items():
+            if _utolso9(k) == cel:
+                if isinstance(v, int) or str(v).strip().isdigit():
+                    return int(v)
+                uid = user_id_nev_alapjan(str(v))
+                if uid:
+                    return uid
+                break  # név nem található → alapértelmezett felelős
     return int(ALAP_USER_ID) if ALAP_USER_ID.isdigit() else None
 
 
