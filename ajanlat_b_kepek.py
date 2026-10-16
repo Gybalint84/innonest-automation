@@ -445,9 +445,55 @@ def kepvalasztas(hero_jeloltek: list, ref_jeloltek: list, munka: str, szamlalo=N
 # ÖSSZEFOGÓ
 # ══════════════════════════════════════════════════════════════════════════════
 
+def logok_beszerzese(cegek: list, max_db: int, dbx=None, kihagy=None):
+    """Logók a megadott cégekhez (sorrendben, amíg `max_db` össze nem jön): 1. Dropbox
+    („<cég> logo"), 2. a cég honlapja. `kihagy`: cégnevek, amik már a logófalon vannak.
+    Visszaad: (data URI-k listája, forrás-feliratok listája)."""
+    if dbx is None:
+        try:
+            dbx = Dropbox()
+        except Exception as e:
+            log.warning(f"[B-KÉP] Dropbox nem elérhető: {e}")
+            dbx = None
+    kihagy_n = {norm(k) for k in (kihagy or []) if k}
+    logok, forrasok, latott = [], [], set()
+    for c in (cegek or [])[:max(8, max_db * 3)]:
+        if not isinstance(c, dict):
+            continue
+        nev, domain = str(c.get("nev") or "").strip(), str(c.get("domain") or "").strip()
+        if not nev or norm(nev) in kihagy_n or norm(nev) in latott:
+            continue
+        latott.add(norm(nev))
+        uri, honnan = None, ""
+        if dbx:
+            for f in dbx.keres(f"{nev} logo", ["png", "svg", "jpg", "jpeg"], 5):
+                if "logo" in norm(f.get("name")) and egyezes(nev, f.get("name")):
+                    try:
+                        adat = dbx.letolt(f["path_lower"])
+                        if len(adat) <= MAX_LOGO_BAJT:
+                            mime = "image/svg+xml" if f["name"].lower().endswith(".svg") else (
+                                "image/png" if f["name"].lower().endswith(".png") else "image/jpeg")
+                            uri, honnan = data_uri(adat, mime), "Dropbox: " + f.get("path_display", f["name"])
+                            break
+                    except Exception:
+                        continue
+        if not uri and domain:
+            try:
+                uri, honnan = logo_netrol(domain)
+            except Exception as e:
+                log.warning(f"[B-KÉP] logó a netről ({domain}): {e}")
+        if uri:
+            logok.append(uri)
+            forrasok.append(f"{nev} — {honnan}")
+        if len(logok) >= max_db:
+            break
+    return logok, forrasok
+
+
 def kepek_beszerzese(deal: dict, cegnev: str, ugyfel_web: str, ref_deal: dict, logo_cegek: list, munka: str,
-                     szamlalo=None) -> dict:
-    """Visszaad: {hero, refFoto, logok:[...], forrasok:{...}, megjegyzesek:[...]} — data URI-kkel."""
+                     szamlalo=None, hero_kell=True, ref_kell=True, logo_kell=True) -> dict:
+    """Visszaad: {hero, refFoto, logok:[...], forrasok:{...}, megjegyzesek:[...]} — data URI-kkel.
+    `hero_kell` / `ref_kell` / `logo_kell`: melyik képet keressük (az egyedi utasításnál csak a kért)."""
     ki = {"hero": "", "refFoto": "", "logok": [], "forrasok": {}, "megjegyzesek": []}
     try:
         dbx = Dropbox()
@@ -460,14 +506,14 @@ def kepek_beszerzese(deal: dict, cegnev: str, ugyfel_web: str, ref_deal: dict, l
     hero_fajlok, ref_fajlok = [], []
     if dbx:
         url = (deal or {}).get(DROPBOX_FIELD_KEY) or ""
-        if url:
+        if url and hero_kell:
             p = dbx.megosztott_path(url)
             if p:
                 hero_fajlok = dbx.kepek(p, rekurziv=True)
-        if not hero_fajlok and cegnev:
+        if hero_kell and not hero_fajlok and cegnev:
             for p in illo_mappak(dbx, UGYFELKEPEK, cegnev, 2):
                 hero_fajlok += dbx.kepek(p, rekurziv=True)
-        if ref_deal:
+        if ref_kell and ref_deal:
             ref_nev = " ".join(filter(None, [ref_deal.get("ugyfel"), ref_deal.get("cim")]))
             for p in illo_mappak(dbx, KIVITELEZES, ref_deal.get("ugyfel") or ref_nev, 2):
                 ref_fajlok += dbx.kepek(p, rekurziv=True)
@@ -475,7 +521,8 @@ def kepek_beszerzese(deal: dict, cegnev: str, ugyfel_web: str, ref_deal: dict, l
         ref_fajlok.sort(key=lambda f: (0 if re.search(r"elotte|utana|overlay|before|after", norm(f.get("name"))) else 1,
                                        f.get("name", "")))
         hero_fajlok.sort(key=lambda f: f.get("client_modified", ""), reverse=True)
-    hero_fajlok, ref_fajlok = hero_fajlok[:MAX_JELOLT], ref_fajlok[:MAX_JELOLT]
+    hero_fajlok = hero_fajlok[:MAX_JELOLT] if hero_kell else []
+    ref_fajlok = ref_fajlok[:MAX_JELOLT] if ref_kell else []
 
     elo = dbx.elonezetek(hero_fajlok + ref_fajlok) if dbx and (hero_fajlok or ref_fajlok) else {}
     hj = [(f"H{i + 1}", elo[f["path_lower"]], "Dropbox: " + f.get("name", ""), ("dbx", f["path_lower"]))
@@ -484,17 +531,18 @@ def kepek_beszerzese(deal: dict, cegnev: str, ugyfel_web: str, ref_deal: dict, l
           for i, f in enumerate(ref_fajlok) if f["path_lower"] in elo]
 
     # ── net, ha a Dropboxban nincs jelölt ──
-    if not hj and ugyfel_web:
+    if hero_kell and not hj and ugyfel_web:
         for i, (u, adat, mime) in enumerate(foto_jeloltek_netrol(ugyfel_web if ugyfel_web.startswith("http")
                                                                  else "https://" + ugyfel_web)):
             if mime == "image/jpeg":
                 hj.append((f"H{i + 1}", adat, "honlap: " + u, ("net", (adat, mime, u))))
-    if not rj:
+    if ref_kell and not rj:
         for i, (u, adat, mime) in enumerate(foto_jeloltek_netrol(SQM_WEB)):
             if mime == "image/jpeg":
                 rj.append((f"R{i + 1}", adat, "SQM honlap: " + u, ("net", (adat, mime, u))))
 
-    valasz = kepvalasztas([(a, b, c) for a, b, c, _ in hj], [(a, b, c) for a, b, c, _ in rj], munka, szamlalo)
+    valasz = kepvalasztas([(a, b, c) for a, b, c, _ in hj], [(a, b, c) for a, b, c, _ in rj], munka, szamlalo) \
+        if (hj or rj) else {}
 
     def betolt(jeloltek, az, meret):
         for a, _, leiras, (forras, adat) in jeloltek:
@@ -513,38 +561,14 @@ def kepek_beszerzese(deal: dict, cegnev: str, ugyfel_web: str, ref_deal: dict, l
         ki["hero"], ki["forrasok"]["hero"] = betolt(hj, valasz["hero"], "w1024h768")
     if valasz.get("ref"):
         ki["refFoto"], ki["forrasok"]["refFoto"] = betolt(rj, valasz["ref"], "w1024h768")
-    if not ki["hero"]:
+    if hero_kell and not ki["hero"]:
         ki["megjegyzesek"].append("Hero fotót nem találtam (az ügyfél Dropbox-mappájában és a honlapján sem volt alkalmas) — töltsd fel kézzel.")
-    if not ki["refFoto"]:
+    if ref_kell and not ki["refFoto"]:
         ki["megjegyzesek"].append("Referenciafotót nem találtam — töltsd fel kézzel.")
 
     # ── logók ──
-    forras_logok = []
-    for c in (logo_cegek or [])[:8]:
-        nev, domain = str(c.get("nev") or "").strip(), str(c.get("domain") or "").strip()
-        if not nev:
-            continue
-        uri, honnan = None, ""
-        if dbx:
-            for f in dbx.keres(f"{nev} logo", ["png", "svg", "jpg", "jpeg"], 5):
-                if "logo" in norm(f.get("name")) and egyezes(nev, f.get("name")):
-                    try:
-                        adat = dbx.letolt(f["path_lower"])
-                        if len(adat) <= MAX_LOGO_BAJT:
-                            mime = "image/svg+xml" if f["name"].lower().endswith(".svg") else (
-                                "image/png" if f["name"].lower().endswith(".png") else "image/jpeg")
-                            uri, honnan = data_uri(adat, mime), "Dropbox: " + f.get("path_display", f["name"])
-                            break
-                    except Exception:
-                        continue
-        if not uri and domain:
-            uri, honnan = logo_netrol(domain)
-        if uri:
-            ki["logok"].append(uri)
-            forras_logok.append(f"{nev} — {honnan}")
-        if len(ki["logok"]) >= 6:
-            break
-    ki["forrasok"]["logok"] = forras_logok
-    if len(ki["logok"]) < 6:
-        ki["megjegyzesek"].append(f"Partnerlogó: {len(ki['logok'])} db található — a hiányzókat töltsd fel kézzel.")
+    if logo_kell:
+        ki["logok"], ki["forrasok"]["logok"] = logok_beszerzese(logo_cegek, 6, dbx)
+        if len(ki["logok"]) < 6:
+            ki["megjegyzesek"].append(f"Partnerlogó: {len(ki['logok'])} db található — a hiányzókat töltsd fel kézzel.")
     return ki
