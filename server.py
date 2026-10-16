@@ -94,6 +94,8 @@ from szoveg_ai import register_szoveg_ai_routes
 register_szoveg_ai_routes(app)
 from cloudtalk_visszahivas import register_cloudtalk_routes
 register_cloudtalk_routes(app)
+from ajanlat_b_ai import register_ajanlat_b_routes
+register_ajanlat_b_routes(app)
 # ── Indítás ───────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
