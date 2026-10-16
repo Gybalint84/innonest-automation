@@ -19,6 +19,8 @@ Végpontok:
   GET  /pdf-kikuld-status/<proj_id>  – webapp polling: email sikeresen elküldve?
   POST /arajanlat-v2-extra           – a webapp átadja a "B" sablon extra mezőit
                                        (szövegek + képek; ár/tétel SOSEM)
+  POST /arajanlat-v3-extra           – ugyanez a "C" (9 oldalas) sablonhoz
+                                       (szövegek, képek, változat-BID-ek; ár SOSEM)
 """
 
 import os
@@ -37,17 +39,12 @@ from flask import request, jsonify, Response, redirect
 from playwright.async_api import async_playwright
 
 from innonest_core import login, load_session, make_browser_args, _loop, upload_csatolmany
+from pipedrive_addon import PDFquotationSENDdealOWNER
 
 log = logging.getLogger(__name__)
 
 PIPEDRIVE_API_TOKEN = os.environ.get("PIPEDRIVE_API_TOKEN", "")
 PDF_TOOL_SECRET     = os.environ.get("PDF_TOOL_SECRET", "")
-
-# "SQM Email Küldő" Apps Script web app (webapp_email_v1.js)
-EMAIL_WEBAPP_URL    = os.environ.get("EMAIL_WEBAPP_URL", "")
-EMAIL_WEBAPP_SECRET = os.environ.get("EMAIL_WEBAPP_SECRET", "")
-PDF_EMAIL_KISERLETEK = 3      # összes próbálkozás (idempotens: requestId alapján)
-PDF_EMAIL_VARAKOZAS  = 5      # mp két próbálkozás között
 
 
 def _pdf_tool_auth_ok(req) -> bool:
@@ -74,6 +71,9 @@ TOOL_PATH   = os.path.join(BASE_DIR, "sablonok", "pdf_tool.html")
 SABLON_PATHS = {
     "a": SABLON_PATH,
     "b": os.path.join(BASE_DIR, "sablonok", "arajanlat_sablon_v2.html"),
+    # 2026-10: "C" — 9 oldalas sablon (sablonok/arajanlat_sablon_v3.html +
+    # arajanlat_v3_blokkok.py). Változatok: több BID, mindegyik ára az Innonestből.
+    "c": os.path.join(BASE_DIR, "sablonok", "arajanlat_sablon_v3.html"),
 }
 
 
@@ -156,13 +156,100 @@ def _v2_extra_olvas(proj_id: str) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# A „C" SABLON MEZŐI A WEBAPPBÓL (arajanlat-v3-extra) — 2026-10
+# ══════════════════════════════════════════════════════════════════════════════
+# Ugyanaz az elv, mint a B-nél: CSAK szöveg, kép és BID-hivatkozás jöhet. A
+# változatok és a külön rendelhető tételek ÁRAIT a generátor a megadott BID-ek
+# Innonest-ajánlataiból olvassa ki (lásd _full_pipeline), az extra-ból SOHA.
+V3_ENGEDETT_MEZOK = {
+    # általános
+    "oldalak_kihagy", "revizio", "kapcsolat_nev", "kapcsolat_email", "kapcsolat_tel",
+    # 1. borító
+    "projekt_cim", "hero_kep", "helyszin_cimke", "terulet", "terulet_cimke", "lead",
+    "kiemelesek", "megrendelo_telephely",
+    # 2. vezetői összefoglaló
+    "osszefoglalo_cim", "osszefoglalo_bevezeto", "feladat", "feltetelek", "javaslat",
+    "beruhazas_megjegyzes", "leallas", "kovetkezo_lepesek", "hatarido", "harom_dolog",
+    # 3. felmérés
+    "felmeres_cim", "felmeres_datum", "felmero", "felmeres_fotok", "felmeres_sorok", "kovetkeztetes",
+    # 4. műszaki megoldás
+    "muszaki_cim", "muszaki_bevezeto", "retegek", "ossz_vastagsag", "igeny_valasz", "menet",
+    # 5. változatok — a "valtozatok" elemeiben: betu, nev, bid, ajanlott, ertekek (szöveg); ÁR NINCS
+    "valtozatok", "valtozat_sorok", "valtozatok_cim", "valtozatok_bevezeto", "miert",
+    "fo_valtozat_nev", "opcio_bid", "opciok_cim", "opciok_megjegyzes",
+    # 6. költségvetés — csak szöveg és százalék; az összegek a nettóból számolódnak
+    "koltsegvetes_cim", "fizetesi_utemezes", "tartalmazza", "nem_resze", "arak_megjegyzes",
+    # 7. ütemterv
+    "utemterv_cim", "utemterv_bevezeto", "merfoldkovek", "gantt_cim", "gantt", "gantt_megjegyzes",
+    "tolunk_kell_cim", "tolunk_kell", "atadjuk_cim", "atadjuk",
+    # 8. referencia
+    "referencia_cim", "referencia_bevezeto", "ref_foto", "ref_foto_felirat", "ref_iparag", "ref_cim",
+    "ref_adatok", "ref_helyzet", "ref_megoldas", "ref_eredmeny", "ref_idezet", "ref_idezet_forras",
+    "csapat_cim", "csapat", "logofal", "logofal_cim", "logofal_kihagy",
+    # 9. elfogadás
+    "elfogadas_cim", "elfogadas_lepesek", "qr_kep", "qr_felirat", "kert_kezdes",
+    "alairo", "alairas_datum", "alairas_kihagy", "elfogadas_megjegyzes",
+}
+V3_EXTRA_MAX = 6 * 1024 * 1024      # több fotó fér bele (hero, 3 felmérési, referencia)
+V3_MAX_KIEG_BID = 3                 # legfeljebb ennyi további BID-et olvasunk ki (2 változat + opciók)
+_v3_extra = {}
+_v3_extra_lock = threading.Lock()
+
+
+def _v3_extra_szures(extra: dict) -> dict:
+    if not isinstance(extra, dict):
+        return {}
+    tiltott = [k for k in extra.keys() if k not in V3_ENGEDETT_MEZOK]
+    if tiltott:
+        log.warning(f"[PDF-V3] Nem engedélyezett mezők eldobva: {tiltott}")
+    szurt = {k: v for k, v in extra.items() if k in V3_ENGEDETT_MEZOK}
+    # a változatokból csak a szöveges kulcsok + BID maradhat (ár/összeg semmiképp)
+    if isinstance(szurt.get("valtozatok"), list):
+        szurt["valtozatok"] = [
+            {k: v.get(k) for k in ("betu", "nev", "bid", "ajanlott", "ertekek", "rovid") if k in v}
+            for v in szurt["valtozatok"] if isinstance(v, dict)
+        ]
+    return szurt
+
+
+def _v3_extra_tarol(proj_id: str, extra: dict):
+    with _v3_extra_lock:
+        _v3_extra[proj_id] = {"extra": extra, "at": time.time()}
+        most = time.time()
+        for k in [k for k, v in _v3_extra.items() if most - v["at"] > V2_EXTRA_TTL]:
+            _v3_extra.pop(k, None)
+
+
+def _v3_extra_olvas(proj_id: str) -> dict:
+    if not proj_id:
+        return {}
+    with _v3_extra_lock:
+        be = _v3_extra.get(proj_id)
+    if not be or time.time() - be["at"] > V2_EXTRA_TTL:
+        return {}
+    return be["extra"]
+
+
+def _v3_kieg_bidek(fo_bid: str, extra: dict) -> list:
+    """A C sablonhoz még kiolvasandó BID-ek: a változatoké és a külön rendelhető tételeké."""
+    out = []
+    jeloltek = [v.get("bid") for v in (extra.get("valtozatok") or []) if isinstance(v, dict)]
+    jeloltek.append(extra.get("opcio_bid"))
+    for b in jeloltek:
+        b = str(b or "").strip().upper()
+        if re.match(r"^BID-\d{4}-\d+$", b) and b != fo_bid.upper() and b not in out:
+            out.append(b)
+    return out[:V3_MAX_KIEG_BID]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # JOB ÁLLAPOT TÁROLÁS (memóriában – egyetlen Railway instance-hoz elegendő)
 # ══════════════════════════════════════════════════════════════════════════════
 
 _jobs = {}
 _jobs_lock = threading.Lock()
 
-_pdf_kikuld_done = {}          # proj_id → dátum string (email sikeresen elküldve)
+_pdf_kikuld_done = {}          # proj_id → {"date": dátum, "sablon": "a"/"b"/"c"} (email sikeresen elküldve)
 _pdf_kikuld_lock = threading.Lock()
 
 
@@ -275,13 +362,22 @@ def tetel_sor(item: dict) -> str:
 # SABLON KITÖLTÉS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def build_arajanlat_html(adatok: dict, sablon: str = "a", extra: dict = None) -> str:
-    """A régi („A") sablon kitöltése. A „B" sablonnál átadjuk a v2 építőnek.
+def build_arajanlat_html(adatok: dict, sablon: str = "a", extra: dict = None, kiegeszito: dict = None) -> str:
+    """A régi („A") sablon kitöltése. A „B" sablonnál átadjuk a v2 építőnek,
+    a „C"-nél a v3 építőnek.
 
-    MINDKÉT ÁGON az `adatok` az úr: a tételek és az összegek a
+    MINDEN ÁGON az `adatok` az úr: a tételek és az összegek a
     `_scrape_arajanlat` kimenetéből származnak, azaz az Innonestből. Az
-    `extra` csak a v2 szövegeit/képeit tartalmazza (lásd V2_ENGEDETT_MEZOK).
+    `extra` csak szöveget/képet tartalmaz (lásd V2_/V3_ENGEDETT_MEZOK); a C
+    változatainak árai a `kiegeszito`-ből (= további BID-ek Innonest-scrape-je).
     """
+    if (sablon or "a").strip().lower() == "c" and os.path.exists(SABLON_PATHS["c"]):
+        try:
+            from arajanlat_v3_blokkok import build_arajanlat_html_v3
+            return build_arajanlat_html_v3(adatok, _v3_extra_szures(extra or {}), kiegeszito or {})
+        except Exception as e:
+            log.error(f"[PDF-V3] A 'C' sablon nem generálható ({e}) — 'A' sablonnal folytatom.")
+            log.error(traceback.format_exc())
     if (sablon or "a").strip().lower() == "b" and os.path.exists(SABLON_PATHS["b"]):
         try:
             from arajanlat_v2_blokkok import build_arajanlat_html_v2
@@ -860,75 +956,7 @@ def _text_to_email_html(text: str) -> str:
     """
 
 
-def _apps_script_pdf_email(to: str, subject: str, html_body: str,
-                           pdf_b64: str, filename: str, request_id: str) -> dict:
-    """
-    PDF-es email küldése az "SQM Email Küldő" Apps Scripten keresztül.
-
-    Visszatérés: {"eredmeny": "ok" | "hiba" | "bizonytalan", "uzenet": str}
-      ok          – az Apps Script JSON-ban megerősítette a küldést
-      hiba        – az Apps Script JSON-ban hibát jelzett (biztosan NEM ment ki)
-      bizonytalan – egyik próbálkozásra sem jött értelmezhető válasz
-
-    A requestId miatt az újrapróbálás biztonságos: ha az első hívás már
-    kiküldte a levelet, csak a válasz veszett el (302 → googleusercontent
-    GET akadás), az Apps Script a második hívásra duplikátumként "success"-t
-    ad vissza, és NEM küld újra.
-    """
-    if not EMAIL_WEBAPP_URL or not EMAIL_WEBAPP_SECRET:
-        return {"eredmeny": "hiba", "uzenet": "EMAIL_WEBAPP_URL / EMAIL_WEBAPP_SECRET nincs beállítva"}
-
-    payload = {
-        "secret": EMAIL_WEBAPP_SECRET,
-        "action": "PDFquotationSENDdealOWNER",
-        "requestId": request_id,
-        "to": to,
-        "subject": subject,
-        "htmlBody": html_body,
-        "attachmentBase64": pdf_b64,
-        "attachmentName": filename,
-        "attachmentMimeType": "application/pdf",
-    }
-
-    utolso_ok = ""
-    for kiserlet in range(1, PDF_EMAIL_KISERLETEK + 1):
-        if kiserlet > 1:
-            time.sleep(PDF_EMAIL_VARAKOZAS)
-        try:
-            r = requests.post(EMAIL_WEBAPP_URL, json=payload, timeout=(10, 60))
-        except requests.RequestException as e:
-            utolso_ok = f"hálózati hiba: {e}"
-            log.warning(f"[PDF-EMAIL] {kiserlet}. kísérlet – {utolso_ok}")
-            continue
-
-        try:
-            data = r.json()
-            if not isinstance(data, dict):
-                raise ValueError("a JSON nem objektum")
-        except ValueError:
-            utolso_ok = f"nem JSON válasz (HTTP {r.status_code})"
-            log.warning(
-                f"[PDF-EMAIL] {kiserlet}. kísérlet – {utolso_ok}, "
-                f"Content-Type={r.headers.get('Content-Type', '')!r}, "
-                f"body={r.text[:300]!r}"
-            )
-            continue
-
-        if data.get("success"):
-            if data.get("duplicate"):
-                log.info(f"[PDF-EMAIL] Már korábban kiment (requestId={request_id}), nem küldtük újra")
-            log.info(f"[PDF-EMAIL] Elküldve → {to} ({kiserlet}. kísérlet)")
-            return {"eredmeny": "ok", "uzenet": data.get("message", "")}
-
-        hiba = data.get("error") or "ismeretlen hiba"
-        log.error(f"[PDF-EMAIL] Apps Script hibát jelzett: {hiba}")
-        return {"eredmeny": "hiba", "uzenet": hiba}
-
-    log.error(f"[PDF-EMAIL] {PDF_EMAIL_KISERLETEK} kísérlet után sincs értelmezhető válasz ({utolso_ok})")
-    return {"eredmeny": "bizonytalan", "uzenet": utolso_ok}
-
-
-def _send_pdf_email_custom(adatok: dict, pdf_path: str, custom_message: str, request_id: str) -> dict:
+def _send_pdf_email_custom(adatok: dict, pdf_path: str, custom_message: str) -> dict:
     """Egyedi szöveggel küld email a deal üzletfelelősének, PDF csatolmánnyal."""
     info = _find_open_deal_owner_by_cegnev(adatok.get("ugyfel_nev", ""))
     if not info.get("found"):
@@ -943,22 +971,18 @@ def _send_pdf_email_custom(adatok: dict, pdf_path: str, custom_message: str, req
 
     filename = _pdf_filename(adatok.get("bid_szam", "arajanlat"), adatok.get("ugyfel_nev", ""))
 
-    res = _apps_script_pdf_email(info["owner_email"], subject, html_body, pdf_b64, filename, request_id)
+    ok = PDFquotationSENDdealOWNER(
+        info["owner_email"], subject, html_body,
+        attachment_b64=pdf_b64,
+        attachment_name=filename,
+        attachment_mime="application/pdf",
+    )
 
-    if res["eredmeny"] == "ok":
+    if ok:
         log.info(f"[PDF] Email elküldve: {info['owner_email']}")
         return {"success": True, "owner_email": info["owner_email"], "owner_name": info["owner_name"]}
-    if res["eredmeny"] == "bizonytalan":
-        return {
-            "success": False,
-            "bizonytalan": True,
-            "owner_email": info["owner_email"],
-            "message": (
-                "Nem jött visszaigazolás az email-küldésről – lehet, hogy kiment. "
-                "Ellenőrizd az info@ Elküldött mappáját, mielőtt újraküldöd."
-            ),
-        }
-    return {"success": False, "message": f"Email küldés sikertelen: {res['uzenet']}"}
+    else:
+        return {"success": False, "message": "Email küldés sikertelen (Apps Script hiba)"}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -988,11 +1012,29 @@ async def _full_pipeline(bid: str, job_id: str, sablon: str = "a", extra: dict =
 
         adatok = await _scrape_arajanlat(page, bid)
 
+        # „C" sablon: a változatok és a külön rendelhető tételek BID-jeit is
+        # kiolvassuk — az áraik így szintén az Innonestből jönnek.
+        kiegeszito, figyelmeztetes = {}, []
+        if sablon == "c":
+            for kbid in _v3_kieg_bidek(bid, extra or {}):
+                _set_job(job_id, status="scraping", message=f"További változat kiolvasása: {kbid}...")
+                try:
+                    kiegeszito[kbid] = await _scrape_arajanlat(page, kbid)
+                except Exception as e:
+                    log.warning(f"[PDF-V3] {kbid} nem olvasható ki: {e}")
+                    figyelmeztetes.append(f"{kbid} nem olvasható ki — a PDF-ben ára helyén „—” áll.")
+
         _set_job(job_id, status="rendering", message="PDF renderelése...")
-        html = build_arajanlat_html(adatok, sablon, extra)
+        html = build_arajanlat_html(adatok, sablon, extra, kiegeszito)
 
         pdf_page = await context.new_page()
         await pdf_page.set_content(html, wait_until="networkidle")
+        if "__lapozasKesz" in html:
+            # a C sablon szkriptje tördeli a túl hosszú lapokat és számozza az oldalakat
+            try:
+                await pdf_page.wait_for_function("window.__lapozasKesz === true", timeout=15000)
+            except Exception as e:
+                log.warning(f"[PDF-V3] Lapozás nem jelzett vissza időben ({e}) — nyomtatás így is.")
         await pdf_page.pdf(path=pdf_path, format="A4", print_background=True)
         await pdf_page.close()
         log.info(f"[PDF] Renderelve: {pdf_path}")
@@ -1009,6 +1051,7 @@ async def _full_pipeline(bid: str, job_id: str, sablon: str = "a", extra: dict =
         default_message=_generate_default_message(adatok),
         pdf_path=pdf_path,
         _adatok=adatok,
+        figyelmeztetes=figyelmeztetes,
     )
 
 
@@ -1069,8 +1112,7 @@ async def _run_phase2(job_id: str, custom_message: str):
 
     # Email küldés
     _set_job(job_id, status="sending_email", message="Email küldése az értékesítőnek...")
-    # job_id = requestId → az Apps Script ez alapján szűri a duplikált küldést
-    email_result = _send_pdf_email_custom(adatok, pdf_path, custom_message, request_id=job_id)
+    email_result = _send_pdf_email_custom(adatok, pdf_path, custom_message)
 
     # ── Webapp polling visszajelzés ──────────────────────────────────────────
     # Ha az email sikeresen elment, tároljuk a proj_id → dátum párost.
@@ -1081,9 +1123,12 @@ async def _run_phase2(job_id: str, custom_message: str):
         _kikuld_date = datetime.date.today().isoformat()
         _proj_id_ref = job.get("proj_id")
         if _proj_id_ref:
+            # 2026-10-16: a sablon (A/B/C) is — a webapp a Mentett projekteknél kiírja
+            _kikuld_sablon = (job.get("sablon") or "a").strip().lower()
             with _pdf_kikuld_lock:
-                _pdf_kikuld_done[_proj_id_ref] = _kikuld_date
-            log.info(f"[PDF] Polling visszajelzés tárolva: proj_id={_proj_id_ref}, dátum={_kikuld_date}")
+                _pdf_kikuld_done[_proj_id_ref] = {"date": _kikuld_date, "sablon": _kikuld_sablon}
+            log.info(f"[PDF] Polling visszajelzés tárolva: proj_id={_proj_id_ref}, dátum={_kikuld_date}, "
+                     f"sablon={_kikuld_sablon}")
 
     # Státusz változtatás: Piszkozat → Elküldve (csak ha az email sikeres volt)
     if email_result.get("success"):
@@ -1102,8 +1147,6 @@ async def _run_phase2(job_id: str, custom_message: str):
                 await browser.close()
         except Exception as e:
             log.warning(f"[PDF] Státusz változtatás hiba (nem kritikus): {e}")
-    elif email_result.get("bizonytalan"):
-        log.warning(f"[PDF] Státusz változtatás kihagyva (email státusza bizonytalan – ellenőrizd az Elküldött mappát): {bid}")
     else:
         log.info(f"[PDF] Státusz változtatás kihagyva (email sikertelen): {bid}")
 
@@ -1228,7 +1271,12 @@ def register_pdf_routes(app):
         # A "B" sablon extra mezői (szövegek, képek) a webappból érkeznek a
         # /arajanlat-v2-extra végponton — ÁRAT és TÉTELT sosem tartalmaznak
         # (lásd V2_ENGEDETT_MEZOK), azok kizárólag az Innonest-scrape-ből jönnek.
-        extra = _v2_extra_olvas(proj_id) if sablon == "b" else {}
+        if sablon == "b":
+            extra = _v2_extra_olvas(proj_id)
+        elif sablon == "c":
+            extra = _v3_extra_olvas(proj_id)
+        else:
+            extra = {}
         job_id = str(uuid.uuid4())
         _set_job(job_id, status="started", message="Indítás...", bid=bid, proj_id=proj_id, sablon=sablon)
         asyncio.run_coroutine_threadsafe(_run_pipeline_safe(bid, job_id, sablon, extra), _loop)
@@ -1260,6 +1308,33 @@ def register_pdf_routes(app):
         szurt = _v2_extra_szures(extra)
         _v2_extra_tarol(proj_id, szurt)
         log.info(f"[PDF-V2] extra mentve: proj={proj_id}, {len(szurt)} mező, {meret // 1024} KB")
+        return jsonify({"ok": True, "mezok": sorted(szurt.keys())})
+
+    @app.route("/arajanlat-v3-extra", methods=["POST"])
+    def arajanlat_v3_extra():
+        """A webapp „C ajánlat adatai" menüpontjának mezői (a B-vel azonos
+        módon, postMessage → pdf_tool → ide). Ár/összeg innen nem jöhet."""
+        if not _pdf_tool_auth_ok(request):
+            return jsonify({"error": "Unauthorized"}), 401
+        data = request.get_json(silent=True) or {}
+        proj_id = (data.get("proj_id") or "").strip()
+        if not proj_id:
+            return jsonify({"error": "Hiányzó proj_id"}), 400
+        extra = data.get("extra") or {}
+        if not isinstance(extra, dict):
+            return jsonify({"error": "Az 'extra' nem objektum"}), 400
+        try:
+            meret = len(json.dumps(extra, ensure_ascii=False).encode("utf-8"))
+        except Exception:
+            return jsonify({"error": "Az 'extra' nem szerializálható"}), 400
+        if meret > V3_EXTRA_MAX:
+            return jsonify({
+                "error": f"Túl nagy adat ({meret // 1024} KB), max {V3_EXTRA_MAX // 1024} KB. "
+                         f"Kisebb képeket tölts fel."
+            }), 413
+        szurt = _v3_extra_szures(extra)
+        _v3_extra_tarol(proj_id, szurt)
+        log.info(f"[PDF-V3] extra mentve: proj={proj_id}, {len(szurt)} mező, {meret // 1024} KB")
         return jsonify({"ok": True, "mezok": sorted(szurt.keys())})
 
     @app.route("/confirm-arajanlat-pdf/<job_id>", methods=["POST"])
@@ -1309,9 +1384,11 @@ def register_pdf_routes(app):
     def pdf_kikuld_status(proj_id):
         """Webapp polling: az email elküldése után visszaadja a dátumot (egyszeri)."""
         with _pdf_kikuld_lock:
-            date = _pdf_kikuld_done.pop(proj_id, None)
-        if date:
-            return jsonify({"done": True, "date": date})
+            rec = _pdf_kikuld_done.pop(proj_id, None)
+        if rec:
+            if isinstance(rec, dict):
+                return jsonify({"done": True, "date": rec.get("date"), "sablon": (rec.get("sablon") or "a").upper()})
+            return jsonify({"done": True, "date": rec})
         return jsonify({"done": False})
 
     log.info("[PDF] Végpontok regisztrálva: /pdf-tool, /generate-arajanlat-pdf, /confirm-arajanlat-pdf/<id>, /pdf-status/<id>, /pdf-download/<id>, /pdf-kikuld-status/<proj_id>, /arajanlat-v2-extra")
