@@ -860,6 +860,172 @@ def elonezet(be: dict) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# EGYEDI UTASÍTÁS (2026-10-16) — „csak ezt csináld meg" a már kitöltött B ajánlaton
+# ══════════════════════════════════════════════════════════════════════════════
+# A webapp a JELENLEGI mezőket (szöveg), a képek állapotát (van-e hero/ref, hány logó és
+# melyik cégeké) és Bálint utasítását küldi. Az AI csak azt módosítja, amit az utasítás
+# kér; a képekhez műveletet ad (új logók cégekkel, hero/ref újrakeresése), amit a
+# szerver hajt végre (ajanlat_b_kepek: Dropbox, majd net).
+
+_UT_MEZOK = ["projektCim", "helyszin", "rendszer", "kiemelesek", "kiemelesLabjegyzet", "muszakiBekezdes1",
+             "muszakiBekezdes2", "retegrend", "retegrendMegjegyzes", "feltetelekKivonat", "feltetelekUtalas",
+             "fizetesiUtemezes", "arakMegjegyzes", "kapcsolatSzerep", "lepesek", "utemezesBekezdes", "refChip",
+             "refCim", "refSorok", "logofalCim", "logofalMegjegyzes", "mellekletBlokkok", "mellekletMegjegyzes"]
+
+
+# A módosított mezők listaként jönnek ({mezo, ertekJson}); így a séma kicsi marad (a
+# strukturált kimenet korlátozza a nullable/union mezők számát), és a mezőérték
+# típusát itt ellenőrizzük (ajv2_osszeallit + _ut_ertek).
+UTASITAS_SEMA = {
+    "type": "object",
+    "properties": {
+        "valasz": _SZOVEG,
+        "modositasok": {"type": "array", "items": {
+            "type": "object",
+            "properties": {"mezo": {"type": "string", "enum": list(_UT_MEZOK)}, "ertekJson": _SZOVEG},
+            "required": ["mezo", "ertekJson"]}},
+        "kepek": {
+            "type": "object",
+            "properties": {
+                "ujLogoDb": {"type": "integer"},
+                "logoCsere": {"type": "boolean"},
+                "logoCegek": {"type": "array", "items": _PAR("nev", "domain")},
+                "heroUjra": {"type": "boolean"},
+                "refFotoUjra": {"type": "boolean"},
+                "referenciaDealId": {"type": "integer"},
+            },
+            "required": ["ujLogoDb", "logoCsere", "logoCegek", "heroUjra", "refFotoUjra", "referenciaDealId"],
+        },
+        "megjegyzesek": {"type": "array", "items": _SZOVEG},
+    },
+    "required": ["valasz", "modositasok", "kepek", "megjegyzesek"],
+}
+
+UTASITAS_PROMPT = RENDSZER_PROMPT + """
+
+EGYEDI UTASÍTÁS MÓD: a B ajánlat már ki van töltve (a `jelenlegiMezok` a mostani állapot). Bálint \
+egy konkrét utasítást ad. CSAK azt változtasd, amit az utasítás kér. A `modositasok` \
+listába CSAK a módosított mezők kerülnek: {mezo, ertekJson}, ahol az ertekJson a mező TELJES új \
+értéke JSON-ként (szövegnél JSON-string, pl. "\\"Új cím\\"", listánál a teljes lista, pl. \
+[{"cim":"…","alcim":"…"}]), ugyanabban a szerkezetben, mint a `jelenlegiMezok`-ban. Amit nem \
+módosítasz, az ne szerepeljen. A fenti szabályok (ügyfélnyelv, terméknevek, rétegrend, hangvétel) itt is érvényesek.
+
+KÉPEK (`kepek`): a képeket nem te töltöd le, csak megmondod, mit keressen a szerver.
+- Új partnerlogók: `ujLogoDb` = hány darab KELL (pl. „legalább 3" → 3), `logoCegek` = jelöltek \
+sorrendben, a NYERT dealek ügyfelei közül (lehetőleg azonos munkanem/iparág), a domainnel; adj \
+legalább kétszer annyi jelöltet, mint amennyi kell (nem mindegyikhez lesz logó). A `kepAllapot.\
+logoCegek`-ben lévő cégeket NE add meg újra. A logófalon legfeljebb 12 logó lehet. `logoCsere` = true \
+csak akkor, ha Bálint a meglévő logók CSERÉJÉT kéri (különben a meglévők mellé kerülnek).
+- `heroUjra` / `refFotoUjra`: csak ha az utasítás kifejezetten új hero fotót / referenciafotót kér. \
+Új referenciánál a `referenciaDealId` a választott nyert deal ID-ja (és a ref-mezőket is írd át); \
+különben 0.
+- Ha nincs képművelet: ujLogoDb = 0, logoCegek = [], a többi false / 0.
+
+`valasz`: 1–3 mondat Bálintnak magyarul: mit csináltál (vagy miért nem tudtad). `megjegyzesek`: \
+bizonytalanságok, eltérések (üres lista, ha nincs)."""
+
+
+def utasitas_vegrehajtas(be: dict, allapot=None, szamlalo=None) -> dict:
+    jelez = allapot or (lambda _s: None)
+    szamlalo = szamlalo or TokenSzamlalo(modell_kulcs=be.get("modell"))
+    utasitas = _str(be.get("utasitas"), 2000)
+    if not utasitas:
+        raise ValueError("Üres utasítás.")
+    jelez("Adatok…")
+    pd = pipedrive_kontextus(be.get("dealId")) if be.get("dealId") else {}
+    dealek = nyert_dealek() if PIPEDRIVE_API_TOKEN else []
+    kep = be.get("kepAllapot") or {}
+    adat = {
+        "utasitas": utasitas,
+        "jelenlegiMezok": {k: v for k, v in (be.get("ajv2") or {}).items() if k in _UT_MEZOK},
+        "kepAllapot": {"hero": bool(kep.get("hero")), "refFoto": bool(kep.get("refFoto")),
+                       "logoDb": int(kep.get("logoDb") or 0), "logoCegek": list(kep.get("logoCegek") or [])[:12]},
+        "projekt": be.get("projekt") or {},
+        "feladatok": _feladatok_ainak(be.get("feladatok")),
+        "arajanlatSorok": (be.get("tetelek") or [])[:60],
+        "pipedrive": {k: v for k, v in pd.items() if k != "_deal"} if pd else "nincs Pipedrive-kapcsolat",
+        "nyertDealekReferenciahoz": dealek,
+    }
+    uzenet = ("Bálint utasítása és a projekt adatai (JSON). Hajtsd végre az utasítást.\n\n"
+              + json.dumps(adat, ensure_ascii=False, default=str)[:70000])
+    jelez(f"Utasítás feldolgozása ({szamlalo.modell['nev']})…")
+    ki = claude_json(szamlalo.modell["id"], UTASITAS_PROMPT, uzenet, UTASITAS_SEMA, effort="medium",
+                     max_tokens=16000, timeout=240, szamlalo=szamlalo, lepes="utasitas")
+
+    # ── szöveges mezők: csak a nem-null (módosított) mezők, a szokásos tisztítással ──
+    mezok = {}
+    for m in ki.get("modositasok") or []:
+        if not isinstance(m, dict) or m.get("mezo") not in _UT_MEZOK:
+            continue
+        try:
+            v = json.loads(m.get("ertekJson") or "null")
+        except ValueError:
+            v = m.get("ertekJson")          # sima szöveget is elfogadunk
+        if v is not None:
+            mezok[m["mezo"]] = v
+    tiszta = ajv2_osszeallit(mezok, {}) if mezok else {}
+    valtozas = {k: v for k, v in tiszta.items() if k in mezok}
+    megj = [_str(m, 400) for m in (ki.get("megjegyzesek") or []) if _str(m)]
+    hibak = ellenorzes({**(be.get("ajv2") or {}), **valtozas}, be.get("feladatok") or []) if valtozas else []
+    megj += ["Ellenőrizd: " + h for h in hibak if "Terméknév" in h]
+
+    # ── képek ──
+    km = ki.get("kepek") or {}
+    kepek, forrasok = {}, {}
+    try:
+        from ajanlat_b_kepek import kepek_beszerzese, logok_beszerzese
+        meglevo = 0 if km.get("logoCsere") else int(kep.get("logoDb") or 0)
+        kell = max(0, min(int(km.get("ujLogoDb") or 0), 12 - meglevo))
+        if kell:
+            jelez(f"Logók keresése ({kell} db)…")
+            uj, fr = logok_beszerzese(km.get("logoCegek") or [], kell, kihagy=kep.get("logoCegek") or [])
+            if uj:
+                kepek["logokUj"] = uj
+                kepek["logoCsere"] = bool(km.get("logoCsere"))
+                forrasok["logok"] = fr
+            if len(uj) < kell:
+                megj.append(f"{kell} logóból {len(uj)} lett meg — a többit töltsd fel kézzel, vagy kérj más cégeket.")
+        elif int(km.get("ujLogoDb") or 0) and meglevo >= 12:
+            megj.append("A logófal megtelt (12 logó) — újat csak csere esetén tudok betenni.")
+        if km.get("heroUjra") or km.get("refFotoUjra"):
+            jelez("Képek keresése (Dropbox, net)…")
+            ref_deal = next((d for d in dealek if d.get("id") == km.get("referenciaDealId")), None)
+            org = pd.get("szervezet") or {}
+            munka = " · ".join(filter(None, [_str((be.get("ajv2") or {}).get("projektCim")),
+                                             _str((be.get("ajv2") or {}).get("rendszer"))]))
+            k2 = kepek_beszerzese(pd.get("_deal") or {}, org.get("nev") or (be.get("projekt") or {}).get("ugyfel", ""),
+                                  org.get("weboldal", ""), ref_deal, [], munka, szamlalo=szamlalo,
+                                  hero_kell=bool(km.get("heroUjra")), ref_kell=bool(km.get("refFotoUjra")),
+                                  logo_kell=False)
+            for k in ("hero", "refFoto"):
+                if k2.get(k):
+                    kepek[k] = k2[k]
+                    forrasok[k] = (k2.get("forrasok") or {}).get(k, "")
+            megj += k2.get("megjegyzesek") or []
+    except Exception as e:
+        log.exception("[B-AI] utasítás — képhiba")
+        megj.append(f"A képeket nem sikerült beszerezni ({str(e)[:120]}).")
+    return {
+        "valasz": _str(ki.get("valasz"), 800),
+        "ajv2": valtozas,
+        "kepek": kepek,
+        "kepForrasok": forrasok,
+        "megjegyzesek": megj,
+        "tokenek": szamlalo.osszesito(),
+    }
+
+
+def _job_futtat_utasitas(job_id, be):
+    try:
+        _job(job_id, allapot="fut")
+        szamlalo = TokenSzamlalo(lambda o: _job(job_id, tokenek=o), be.get("modell"))
+        _job(job_id, allapot="kesz", eredmeny=utasitas_vegrehajtas(be, lambda t: _job(job_id, lepes=t), szamlalo))
+    except Exception as e:
+        log.exception("[B-AI] utasítás hiba")
+        _job(job_id, allapot="hiba", hiba=str(e)[:300])
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # VÉGPONTOK
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -881,6 +1047,22 @@ def register_ajanlat_b_routes(app):
         job_id = str(uuid.uuid4())
         _job(job_id, allapot="indul")
         threading.Thread(target=_job_futtat, args=(job_id, be), daemon=True).start()
+        return jsonify({"ok": True, "job_id": job_id})
+
+    @app.route("/ajanlat-b-utasitas", methods=["POST"])
+    def ajanlat_b_utasitas():
+        """Egyedi utasítás a már kitöltött B ajánlaton (job; az állapot ugyanazon a
+        GET /ajanlat-b-kitoltes/<job_id> végponton kérdezhető le)."""
+        if not _auth():
+            return jsonify({"ok": False, "error": "Unauthorized"}), 401
+        if not ANTHROPIC_API_KEY:
+            return jsonify({"ok": False, "error": "Az AI nincs bekötve (hiányzik az ANTHROPIC_API_KEY)."}), 503
+        be = request.get_json(silent=True) or {}
+        if not str(be.get("utasitas") or "").strip():
+            return jsonify({"ok": False, "error": "Írd be, mit csináljon az AI."}), 400
+        job_id = str(uuid.uuid4())
+        _job(job_id, allapot="indul")
+        threading.Thread(target=_job_futtat_utasitas, args=(job_id, be), daemon=True).start()
         return jsonify({"ok": True, "job_id": job_id})
 
     @app.route("/ajanlat-b-kitoltes/<job_id>", methods=["GET"])
