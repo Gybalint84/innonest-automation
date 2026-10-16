@@ -119,6 +119,20 @@ számformátumban (1 250 m², 340 fm, 12 db). Ne használj **csillagos** jelöl�
 melléklet-blokkok szövegében, ahol a **…** félkövér kiemelést jelent (számok, határidők). \
 Árat, összeget, egységárat NEM írsz sehova (az árak külön, a rendszerből kerülnek a PDF-be).
 
+ÜGYFÉLNYELV, TERMÉKNEVEK (2026-10-16): a `feladatok[].belsoReceptura` a BELSŐ receptúra anyaglistája — arra való, hogy értsd, milyen rendszer készül (alapozó, festék, záróréteg, gyantahabarcs, fugatömítő…). Az ügyfélnek szóló mezőkbe (borító, műszaki tartalom, rétegrend, feltételek, lépések) NE írj terméknevet, márkanevet, típusjelet (pl. „Primer GW", „PU SG Coloured", „StoPox GH 205") — az anyag FUNKCIÓJÁT és jellegét írd („tapadásjavító alapozó", „poliuretán jelölőbevonat", „víztiszta, szatén záróréteg", „epoxi gyantahabarcs", „rugalmas PU fugatömítő"). Kivétel: ha az ügyfél (Pipedrive jegyzet/levél) kifejezetten megnevezett egy terméket vagy rendszert. A receptúra anyaglistái pontatlanok, átfedők lehetnek — a MUNKAFOLYAMATBÓL (feladatok, mennyiségek, ajánlati sorok leírása) indulj ki, ne az anyaglistából; az ellentmondást írd a megjegyzésekbe.
+
+RÉTEGREND (2026-10-16): a rétegrend az ügyfélnek mutatja meg, MI KÉSZÜL a padlóján, felülről lefelé. Minden réteg címe a FUNKCIÓ (nem terméknév), az alcím a tartalma a projekt KONKRÉT mennyiségeivel. Az előkészítés (csiszolás, marás, régi bevonat eltávolítása, maszkolás, pormentesítés) és a helyi aljzatjavítás (dübelhely, repedés, kitörés, dilatáció) is SAJÁT réteg, ha van ilyen feladat — ezek az ajánlat részei, az ügyfélnek látnia kell. Ha több alapozó/bevonat réteg van, egy funkcionális rétegbe vond össze (pl. „3 réteg"). Az utolsó réteg mindig a meglévő aljzat (anyaga, pl. „kéregerősített beton"). VELUX-példa (vonalfelújítás, 5 réteg):
+  „Szatén záróréteg" / „víztiszta védőbevonat a jelöléseken, 10 cm szélességben"
+  „Színes jelölőbevonat" / „sárga 385 fm · piros 15 fm, 10 cm széles, kéregerősített betonra"
+  „Helyi aljzatjavítás" / „100 db dübelhely epoxi gyantahabarccsal, 20 fm dilatáció epoxi szélfelújítással és rugalmas PU-kitöltéssel"
+  „Előkészített fogadófelület" / „régi felfestés lecsiszolása 600 fm, előkészítő csiszolás és maszkolás 400 fm, pormentesítés"
+  „Meglévő aljzat" / „kéregerősített beton"
+
+MŰSZAKI TARTALOM — VELUX-példa (szerkezet és hangvétel, nem kötelező szöveg):
+  1. bekezdés: „A fertőszentmiklósi gyártócsarnok kéregerősített betonpadlóján a meglévő, elhasználódott padlójelölések felújítását és a helyi aljzathibák javítását végezzük el. A korábbi felfestést 600 fm hosszon csiszolással távolítjuk el, a 100 db dübelhelyet epoxi gyantahabarccsal töltjük ki és síkba csiszoljuk, majd 400 fm új, 10 cm széles jelölést készítünk sárga (385 fm) és piros (15 fm) színben, kéregerősített betonra alkalmas, tapadásjavított rétegrenddel. A jelöléseket víztiszta, szatén záróréteg védi a kopástól és könnyíti a tisztítást. A fertődi telephelyen 20 fm dilatációs hézag szélének epoxi helyreállítását és rugalmas újratömítését végezzük el."
+  2. bekezdés: „A kivitelezést a Megrendelő által jelzett november 2-i vagy november 9-i héten tudjuk ütemezni, hétköznapi kivitelezéssel. A munkaterületet egyben vesszük át, és egyben, a teljes munka elkészültével adjuk vissza: csiszolás és javítás, majd a jelölés és a záróréteg felhordása, a technológiai kötési idők betartásával. A felület a záróréteg felhordásától számított 12–24 órán belül visszaadható."
+  Vagyis: először a cél (mit oldunk meg az ügyfélnek), aztán a munkafolyamat sorrendben, konkrét mennyiségekkel, funkcionális anyagmegnevezéssel; több helyszínnél helyszínenként.
+
 MEZŐK (zárójelben a VELUX-példa)
 - projektCim: ügyfélbarát cím; a belső projektnév/tárgy ne legyen szó szerint átvéve \
 („Csarnokpadló közlekedési vonalazása").
@@ -131,11 +145,11 @@ a számlázási címtől („Fertőd, VELUX gyár").
 „Hétköznapi" / „kivitelezés, a terület egyben történő átadásával").
 - kiemelesLabjegyzet: a *-os kártya feltétele, a rendszerhez illően („* +15 °C feletti \
 aljzathőmérséklet mellett, gyalogos forgalomra értendő; targoncaforgalom 24 óra után.").
-- muszakiBekezdes1: mi készül, milyen rendszerrel, KONKRÉT mennyiségekkel (2–3 mondat).
+- muszakiBekezdes1: mi készül és miért, a munkafolyamat sorrendjében, KONKRÉT mennyiségekkel, terméknév nélkül (3–4 mondat; lásd a példát fent).
 - muszakiBekezdes2: az ütemezés a projekt szerint: az ügyfél által megadott időszak, hétköznap vagy \
 hétvége, egyben vagy szakaszosan átvett terület, mikor használható újra (2–3 mondat).
-- retegrend: 2–5 réteg FELÜLRŐL LEFELÉ; az utolsó a meglévő aljzat. {cim, alcim}. Csak az \
-adatokban szereplő anyagokból.
+- retegrend: 2–5 réteg FELÜLRŐL LEFELÉ {cim = funkció, alcim = tartalom + mennyiség}; az előkészítés \
+és a javítás is réteg; az utolsó a meglévő aljzat (lásd RÉTEGREND fent). Csak az adatokban szereplő munkákból.
 - retegrendMegjegyzes: 1 mondat a rétegrendhez/kivitelezéshez fontos kiegészítésről \
 („A vonalak szélessége 10 cm; a pontos nyomvonal a helyszíni bejáráson kerül véglegesítésre.").
 - feltetelekKivonat: 4–6 rövid pont a projekthez illő kivitelezési feltételekről (pl. a munkaterület \
@@ -367,6 +381,108 @@ def _claude_eszkoz(uzenet, szamlalo):
                        effort="medium", max_tokens=24000, timeout=280, szamlalo=szamlalo, lepes="szoveg")
 
 
+def _claude_javitas(uzenet, elso, hibak, szamlalo):
+    """Második kör: az első kitöltés + a talált hibák → a teljes, javított JSON."""
+    keres = (uzenet + "\n\nAZ ELSŐ KITÖLTÉSED (JSON):\n" + json.dumps(elso, ensure_ascii=False)[:40000]
+             + "\n\nAz ellenőrzés ezeket találta — javítsd őket, a többi mezőt hagyd változatlanul, "
+               "és add vissza a TELJES kitöltést ugyanabban a sémában:\n- " + "\n- ".join(hibak))
+    return claude_json(szamlalo.modell["id"], RENDSZER_PROMPT, keres, ESZKOZ["input_schema"],
+                       effort="low", max_tokens=24000, timeout=240, szamlalo=szamlalo, lepes="javitas")
+
+
+# ── ügyfélszöveg-ellenőrzés ──
+# Ügyfélnek szóló mezők (a megjegyzések, referencia, logófal, melléklet nem ide tartozik:
+# a melléklet a webapp alap-blokkjaiból jön, a referencia más projekt adata).
+_UGYFEL_MEZOK = ("projektCim", "rendszer", "kiemelesek", "kiemelesLabjegyzet", "muszakiBekezdes1",
+                 "muszakiBekezdes2", "retegrend", "retegrendMegjegyzes", "feltetelekKivonat", "lepesek",
+                 "utemezesBekezdes")
+_ELOKESZITES = re.compile(r"csiszol|marás|mar[áa]s|lemar|maszkol|előkészít|elokeszit|pormentes|szemcseszór|"
+                          r"sörétez|bevonat.{0,20}eltávolít|felfestés.{0,20}eltávolít", re.I)
+_JAVITAS = re.compile(r"javít|dübel|dilatáci|hézag|repedés|kitörés|habarcs|kátyú|fugá", re.I)
+
+
+def _feladatok_ainak(feladatok):
+    """A webapp feladatai az AI-nak: az `anyagok` (receptúra-terméknevek) `belsoReceptura`
+    néven mennek, hogy egyértelmű legyen: háttéradat, nem ügyfélszöveg."""
+    out = []
+    for f in (feladatok or [])[:40]:
+        if not isinstance(f, dict):
+            continue
+        g = {k: v for k, v in f.items() if k != "anyagok"}
+        if f.get("anyagok"):
+            g["belsoReceptura"] = f.get("anyagok")
+        out.append(g)
+    return out
+
+
+def _termeknev_kulcsok(feladatok):
+    """A receptúrák terméknevei közül a jól felismerhetők (típusjel: nagybetűs rövidítés,
+    szám vagy Sto-márka) — a köznévi anyagokat (pl. „kvarchomok") nem keressük."""
+    kulcsok = set()
+    for f in feladatok or []:
+        for a in (f.get("anyagok") or []) if isinstance(f, dict) else []:
+            szavak = re.findall(r"[\wÀ-ž]+", str(a or ""))
+            if not szavak:
+                continue
+            if not any(re.search(r"[A-Z]{2,}|\d", w) or re.match(r"Sto[A-Z]", w) for w in szavak[:3]):
+                continue
+            kulcs = " ".join(szavak[:2]) if len(szavak) >= 2 else szavak[0]
+            if len(kulcs) >= 4:
+                kulcsok.add(kulcs)
+            if re.match(r"Sto[A-Z]\w+", szavak[0]):
+                kulcsok.add(szavak[0])
+    # kis/nagybetű szerint egy; ha egy rövidebb kulcs eleje egy hosszabbnak, a rövidebb elég
+    egyedi = {}
+    for k in sorted(kulcsok, key=len):
+        kl = k.lower()
+        if kl in egyedi or any(kl.startswith(r + " ") for r in egyedi):
+            continue
+        egyedi[kl] = k
+    return set(egyedi.values())
+
+
+def _lapos(v):
+    if isinstance(v, str):
+        return v
+    if isinstance(v, list):
+        return " ".join(_lapos(x) for x in v)
+    if isinstance(v, dict):
+        return " ".join(_lapos(x) for x in v.values())
+    return ""
+
+
+def ellenorzes(ki: dict, feladatok: list) -> list:
+    """Visszaad: a talált problémák listája (magyar mondatok); üres = rendben."""
+    hibak = []
+    ki = ki if isinstance(ki, dict) else {}
+    szoveg = {m: _lapos(ki.get(m)) for m in _UGYFEL_MEZOK}
+    talalt = {}
+    for kulcs in _termeknev_kulcsok(feladatok):
+        minta = re.compile(r"(?<![\wÀ-ž])" + r"\s+".join(map(re.escape, kulcs.split())) + r"(?![\wÀ-ž])", re.I)
+        for m, t in szoveg.items():
+            if minta.search(t):
+                talalt.setdefault(kulcs, []).append(m)
+    if talalt:
+        hibak.append("Terméknév az ügyfélszövegben (funkcióval/jelleggel írd le helyette): " + "; ".join(
+            f"„{k}” ({', '.join(sorted(set(v)))})" for k, v in sorted(talalt.items())))
+    reteg = [x for x in (ki.get("retegrend") or []) if isinstance(x, dict)]
+    rszoveg = " ".join(_lapos(x) for x in reteg)
+    fnevek = " ".join(str((f or {}).get("nev") or "") for f in feladatok or [] if isinstance(f, dict))
+    if reteg:
+        if _ELOKESZITES.search(fnevek) and not _ELOKESZITES.search(rszoveg) and not re.search(r"fogadófelület", rszoveg, re.I):
+            hibak.append("A rétegrendből hiányzik az előkészítés (csiszolás/marás/maszkolás) mint saját réteg, "
+                         "a feladatok mennyiségeivel.")
+        if _JAVITAS.search(fnevek) and not _JAVITAS.search(rszoveg):
+            hibak.append("A rétegrendből hiányzik a helyi aljzatjavítás (dübelhely/dilatáció/repedés) mint saját "
+                         "réteg, a feladatok mennyiségeivel.")
+        utolso = _lapos(reteg[-1])
+        if not re.search(r"aljzat|beton|esztrich|meglévő|burkolat", utolso, re.I):
+            hibak.append("A rétegrend utolsó rétege legyen a meglévő aljzat (anyagával).")
+    elif feladatok:
+        hibak.append("A rétegrend üres — töltsd ki (2–5 réteg felülről lefelé).")
+    return hibak
+
+
 def _str(x, n=600):
     return str(x if x is not None else "").strip()[:n]
 
@@ -431,7 +547,7 @@ def kitoltes(be: dict, allapot=None, szamlalo=None) -> dict:
     kapcs = sqm_kapcsolat(felelos)
     adat = {
         "projekt": be.get("projekt") or {},
-        "feladatok": (be.get("feladatok") or [])[:40],
+        "feladatok": _feladatok_ainak(be.get("feladatok")),
         "arajanlatSorok": (be.get("tetelek") or [])[:60],
         "korulmenyek": (be.get("korulmenyek") or [])[:20],
         "pipedrive": {k: v for k, v in pd.items() if k != "_deal"} if pd
@@ -444,6 +560,22 @@ def kitoltes(be: dict, allapot=None, szamlalo=None) -> dict:
               + json.dumps(adat, ensure_ascii=False, default=str)[:70000])
     jelez(f"Szövegek írása ({szamlalo.modell['nev']})…")
     ki = _claude_eszkoz(uzenet, szamlalo)
+
+    # Önellenőrzés (2026-10-16): terméknév az ügyfélszövegben, hiányzó előkészítő/javító
+    # réteg, hiányzó aljzat → egy javító kör. Ha az is elbukik, az első változat marad.
+    hibak = ellenorzes(ki, be.get("feladatok") or [])
+    if hibak:
+        jelez("Önellenőrzés, javítás…")
+        try:
+            ki2 = _claude_javitas(uzenet, ki, hibak, szamlalo)
+            if isinstance(ki2, dict) and ki2:
+                ki = ki2
+                maradt = ellenorzes(ki, be.get("feladatok") or [])
+                if maradt:
+                    ki.setdefault("megjegyzesek", []).extend("Ellenőrizd: " + h for h in maradt)
+        except Exception as e:
+            log.warning(f"[B-AI] javító kör hiba: {e}")
+            ki.setdefault("megjegyzesek", []).extend("Ellenőrizd: " + h for h in hibak)
 
     megj = [_str(m, 400) for m in (ki.get("megjegyzesek") or []) if _str(m)]
     if not pd and be.get("dealId"):
