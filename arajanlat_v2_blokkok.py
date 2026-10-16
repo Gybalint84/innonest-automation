@@ -6,7 +6,7 @@ Tedd az `arajanlat_pdf.py` mellé, és importáld belőle. A sablon
 
   1. egyszerű szöveges:  {{UGYFEL_NEV}}, {{KELTEZES}}, …   → sima csere, escape-elve
   2. HTML-blokk:         {{TETEL_SOROK}}, {{RETEGREND_SOROK}},
-                         {{FELTETELEK_KIVONAT}}, {{HERO_BLOKK}}, {{BRUTTO_OSSZESEN}}
+                         {{FELTETELEK_KIVONAT}}, {{HERO_BLOKK}}, {{NETTO_KIEMELT}}
                          → az itteni függvények állítják elő
 
 Használat:
@@ -388,6 +388,9 @@ def build_arajanlat_html_v2(adatok: dict, extra: dict = None, oldalak_szama: int
     html = html.replace("{{FELTETELEK_KIVONAT}}", feltetelek_html(extra.get("feltetelek_kivonat", [])))
     html = html.replace("{{TETEL_SOROK}}", tetel_sorok_html(items))
     html = html.replace("{{BRUTTO_OSSZESEN}}", brutto_html(fmt_huf(adatok.get("brutto_osszesen", 0))))
+    # 2026-10-16: a sárga dobozban a nettó végösszeg, a bruttó sima összesítő sor
+    html = html.replace("{{NETTO_KIEMELT}}", brutto_html(fmt_huf(adatok.get("netto_osszesen", 0))))
+    html = html.replace("{{BRUTTO_SOR}}", esc(fmt_huf(adatok.get("brutto_osszesen", 0))))
     # 4. oldal
     html = html.replace("{{LEPESEK}}", lepesek_html(extra.get("lepesek") or _ALAP_LEPESEK))
     html = html.replace("{{QR_BLOKK}}", qr_html(extra.get("qr_kep", ""), extra.get("qr_felirat", "")))
