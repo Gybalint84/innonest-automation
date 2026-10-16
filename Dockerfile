@@ -27,5 +27,6 @@ COPY szoveg_ai.py .
 COPY cloudtalk_visszahivas.py .
 COPY ajanlat_b_ai.py .
 COPY ajanlat_b_kepek.py .
+COPY arajanlat_v2_blokkok.py .
 EXPOSE 5000
 CMD ["python", "server.py"]
