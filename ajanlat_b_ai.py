@@ -614,8 +614,10 @@ def elonezet_adatok(a: dict, pd: dict) -> dict:
         "ugyfel_cim": jel_auto("ugyfel_cim", a.get("ugyfelCim")),
         "ugyfel_adoszam": jel_auto("ugyfel_adoszam", a.get("adoszam")),
         "keltezes": _jel("auto", "keltezes", _fmt_datum(ma.isoformat())),
-        "ervenyes": _jel("auto", "ervenyes", "(Innonestből)"),
-        "fizetesi_feltetel": _jel("auto", "fizetesi_feltetel", "(Innonestből, pl. Átutalás)"),
+        # 2026-10-16: az előnézet úgy nézzen ki, ahogy az ügyfél látja — nincs „(Innonestből)"
+        # helykitöltő; minta-érték megy (a címke mondja meg, hogy a PDF-ben az Innonestből jön)
+        "ervenyes": _jel("auto", "ervenyes", _fmt_datum((ma + datetime.timedelta(days=30)).isoformat())),
+        "fizetesi_feltetel": _jel("auto", "fizetesi_feltetel", "Átutalás"),
         "owner_name": felelos.get("nev") or "",
         "owner_email": felelos.get("email") or "",
         "tetelek": tetelek,
@@ -626,8 +628,8 @@ def elonezet_adatok(a: dict, pd: dict) -> dict:
 AUTO_CIMKEK = {
     "bid": "BID (Innonest)", "targya": "Innonest tárgy = projekt neve", "ugyfel_nev": "Ügyfél neve (Innonest)",
     "ugyfel_cim": "Ügyfél címe (Innonest)", "ugyfel_adoszam": "Adószám (Innonest)",
-    "keltezes": "Keltezés (Innonest)", "ervenyes": "Érvényesség (Innonest)",
-    "fizetesi_feltetel": "Fizetés módja (Innonest)",
+    "keltezes": "Keltezés (Innonest; itt: mai nap)", "ervenyes": "Érvényesség (Innonest; itt: minta +30 nap)",
+    "fizetesi_feltetel": "Fizetés módja (Innonest; itt: minta)",
 }
 
 _ELONEZET_CSS = """
